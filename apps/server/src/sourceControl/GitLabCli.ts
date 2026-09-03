@@ -391,6 +391,44 @@ function toSummaryWithOptionalUpdatedAt(
   return Option.isSome(updatedAt) ? { ...summary, updatedAt } : summary;
 }
 
+// `glab api projects/:path` addresses a project by its namespace path on one host, so a repository
+// pasted as a web or clone URL has to be split into both first. Without the host the path alone
+// would be looked up on whichever host `glab` defaults to, which can resolve a same-named project
+// on the wrong instance. A bare path carries no host and keeps that default.
+function parseProjectTarget(repository: string): {
+  readonly host: string | null;
+  readonly path: string;
+} {
+  const trimmed = repository.trim();
+  let host: string | null = null;
+  let path = trimmed;
+
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
+    try {
+      const url = new URL(trimmed);
+      // Port kept for web URLs, where it belongs to the API, and dropped for ssh, where it does not.
+      host = url.protocol === "http:" || url.protocol === "https:" ? url.host : url.hostname;
+      path = url.pathname;
+    } catch {
+      host = null;
+      path = trimmed;
+    }
+  } else {
+    const scpStyle = /^[^/@\s]+@([^:/\s]+):(.+)$/.exec(trimmed);
+    if (scpStyle?.[1] !== undefined && scpStyle[2] !== undefined) {
+      host = scpStyle[1];
+      path = scpStyle[2];
+    }
+  }
+
+  // GitLab hangs everything below a project off `/-/`, so a deeper URL still names its project.
+  const [beforeProjectContent] = path.split("/-/");
+  const normalized = (beforeProjectContent ?? path)
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/\.git$/i, "");
+  return normalized.length > 0 ? { host, path: normalized } : { host: null, path: trimmed };
+}
+
 function parseRepositoryPath(repository: string): {
   readonly namespacePath: string | null;
   readonly projectPath: string;
@@ -517,10 +555,15 @@ export const make = Effect.gen(function* () {
           ),
         ),
       ),
-    getRepositoryCloneUrls: (input) =>
-      execute({
+    getRepositoryCloneUrls: (input) => {
+      const target = parseProjectTarget(input.repository);
+      return execute({
         cwd: input.cwd,
-        args: ["api", `projects/${encodeURIComponent(input.repository)}`],
+        args: [
+          "api",
+          ...(target.host === null ? [] : ["--hostname", target.host]),
+          `projects/${encodeURIComponent(target.path)}`,
+        ],
       }).pipe(
         Effect.map((result) => result.stdout.trim()),
         Effect.flatMap((raw) =>
@@ -538,7 +581,8 @@ export const make = Effect.gen(function* () {
           ),
         ),
         Effect.map(normalizeRepositoryCloneUrls),
-      ),
+      );
+    },
     createRepository: (input) => {
       const { namespacePath, projectPath } = parseRepositoryPath(input.repository);
       const namespaceId: Effect.Effect<number | null, GitLabCliError> = namespacePath

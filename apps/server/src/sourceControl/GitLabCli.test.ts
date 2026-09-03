@@ -184,6 +184,54 @@ layer("GitLabCli.layer", (it) => {
     }),
   );
 
+  it.effect("looks repositories up by the host and project path a URL names", () =>
+    Effect.gen(function* () {
+      const repositoryJson =
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify({
+          path_with_namespace: "group/subgroup/project",
+          web_url: "https://sourcecontrol.example.com/group/subgroup/project",
+          http_url_to_repo: "https://sourcecontrol.example.com/group/subgroup/project.git",
+          ssh_url_to_repo: "git@sourcecontrol.example.com:group/subgroup/project.git",
+        });
+      const onHost = [
+        "--hostname",
+        "sourcecontrol.example.com",
+        "projects/group%2Fsubgroup%2Fproject",
+      ];
+
+      const cases: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
+        ["https://sourcecontrol.example.com/group/subgroup/project", onHost],
+        ["https://sourcecontrol.example.com/group/subgroup/project.git", onHost],
+        ["https://sourcecontrol.example.com/group/subgroup/project/-/tree/main", onHost],
+        ["https://sourcecontrol.example.com/group/subgroup/project?ref_type=heads", onHost],
+        ["git@sourcecontrol.example.com:group/subgroup/project.git", onHost],
+        // The ssh port is not the API's, so it is dropped; a web port is kept.
+        ["ssh://git@sourcecontrol.example.com:22/group/subgroup/project.git", onHost],
+        [
+          "https://sourcecontrol.example.com:8443/group/subgroup/project",
+          ["--hostname", "sourcecontrol.example.com:8443", "projects/group%2Fsubgroup%2Fproject"],
+        ],
+        // A bare path names no host, so `glab` keeps resolving it against its own default.
+        ["group/subgroup/project", ["projects/group%2Fsubgroup%2Fproject"]],
+      ];
+
+      const sent: Array<readonly [string, ReadonlyArray<string> | undefined]> = [];
+      for (const [repository] of cases) {
+        mockedRun.mockReturnValueOnce(Effect.succeed(processOutput(repositoryJson)));
+
+        const glab = yield* GitLabCli.GitLabCli;
+        yield* glab.getRepositoryCloneUrls({ cwd: "/repo", repository });
+        sent.push([repository, mockedRun.mock.lastCall?.[0].args]);
+      }
+
+      assert.deepStrictEqual(
+        sent,
+        cases.map(([repository, expectedArgs]) => [repository, ["api", ...expectedArgs]]),
+      );
+    }),
+  );
+
   it.effect("creates merge requests through the GitLab API without placing the body in argv", () =>
     Effect.gen(function* () {
       mockedRun.mockReturnValueOnce(Effect.succeed(processOutput("{}")));
