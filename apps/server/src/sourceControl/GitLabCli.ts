@@ -414,7 +414,8 @@ function parseProjectTarget(repository: string): {
       path = trimmed;
     }
   } else {
-    const scpStyle = /^[^/@\s]+@([^:/\s]+):(.+)$/.exec(trimmed);
+    // scp-style, where the user is optional the way `git clone host:group/project.git` allows.
+    const scpStyle = /^(?:[^/@\s]+@)?([^:/\s]+):(.+)$/.exec(trimmed);
     if (scpStyle?.[1] !== undefined && scpStyle[2] !== undefined) {
       host = scpStyle[1];
       path = scpStyle[2];

@@ -206,6 +206,7 @@ layer("GitLabCli.layer", (it) => {
         ["https://sourcecontrol.example.com/group/subgroup/project/-/tree/main", onHost],
         ["https://sourcecontrol.example.com/group/subgroup/project?ref_type=heads", onHost],
         ["git@sourcecontrol.example.com:group/subgroup/project.git", onHost],
+        ["sourcecontrol.example.com:group/subgroup/project.git", onHost],
         // The ssh port is not the API's, so it is dropped; a web port is kept.
         ["ssh://git@sourcecontrol.example.com:22/group/subgroup/project.git", onHost],
         [
