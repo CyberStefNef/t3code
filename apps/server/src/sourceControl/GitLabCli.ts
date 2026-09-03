@@ -391,6 +391,15 @@ function toSummaryWithOptionalUpdatedAt(
   return Option.isSome(updatedAt) ? { ...summary, updatedAt } : summary;
 }
 
+function decodePathname(pathname: string): string {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    // Malformed escapes are not a project path either way, so the raw pathname stands.
+    return pathname;
+  }
+}
+
 // `glab api projects/:path` addresses a project by its namespace path on one host, so a repository
 // pasted as a web or clone URL has to be split into both first. Without the host the path alone
 // would be looked up on whichever host `glab` defaults to, which can resolve a same-named project
@@ -408,7 +417,9 @@ function parseProjectTarget(repository: string): {
       const url = new URL(trimmed);
       // Port kept for web URLs, where it belongs to the API, and dropped for ssh, where it does not.
       host = url.protocol === "http:" || url.protocol === "https:" ? url.host : url.hostname;
-      path = url.pathname;
+      // `pathname` is percent-encoded, and the caller encodes the path it gets back, so decoding
+      // here keeps a pasted URL from being encoded twice.
+      path = decodePathname(url.pathname);
     } catch {
       host = null;
       path = trimmed;

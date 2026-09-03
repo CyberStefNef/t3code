@@ -186,14 +186,12 @@ layer("GitLabCli.layer", (it) => {
 
   it.effect("looks repositories up by the host and project path a URL names", () =>
     Effect.gen(function* () {
-      const repositoryJson =
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
-        JSON.stringify({
-          path_with_namespace: "group/subgroup/project",
-          web_url: "https://sourcecontrol.example.com/group/subgroup/project",
-          http_url_to_repo: "https://sourcecontrol.example.com/group/subgroup/project.git",
-          ssh_url_to_repo: "git@sourcecontrol.example.com:group/subgroup/project.git",
-        });
+      const repositoryJson = `{
+        "path_with_namespace": "group/subgroup/project",
+        "web_url": "https://sourcecontrol.example.com/group/subgroup/project",
+        "http_url_to_repo": "https://sourcecontrol.example.com/group/subgroup/project.git",
+        "ssh_url_to_repo": "git@sourcecontrol.example.com:group/subgroup/project.git"
+      }`;
       const onHost = [
         "--hostname",
         "sourcecontrol.example.com",
@@ -212,6 +210,16 @@ layer("GitLabCli.layer", (it) => {
         [
           "https://sourcecontrol.example.com:8443/group/subgroup/project",
           ["--hostname", "sourcecontrol.example.com:8443", "projects/group%2Fsubgroup%2Fproject"],
+        ],
+        // A pasted URL arrives percent-encoded, so the path is decoded before it is encoded again.
+        [
+          "https://sourcecontrol.example.com/group/subgroup/pro%2Dject",
+          ["--hostname", "sourcecontrol.example.com", "projects/group%2Fsubgroup%2Fpro-ject"],
+        ],
+        // Malformed escapes name no project, so the raw path stands rather than throwing.
+        [
+          "https://sourcecontrol.example.com/group/pro%ZZject",
+          ["--hostname", "sourcecontrol.example.com", "projects/group%2Fpro%25ZZject"],
         ],
         // A bare path names no host, so `glab` keeps resolving it against its own default.
         ["group/subgroup/project", ["projects/group%2Fsubgroup%2Fproject"]],
