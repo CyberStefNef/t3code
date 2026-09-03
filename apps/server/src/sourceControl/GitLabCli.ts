@@ -225,6 +225,25 @@ export class GitLabNamespaceDecodeError extends Schema.TaggedErrorClass<GitLabNa
   }
 }
 
+export class GitLabRepositoryHostMismatchError extends Schema.TaggedErrorClass<GitLabRepositoryHostMismatchError>()(
+  "GitLabRepositoryHostMismatchError",
+  {
+    command: Schema.Literal("glab"),
+    cwd: Schema.String,
+    operation: Schema.Literal("getRepositoryCloneUrls"),
+    requestedHost: Schema.String,
+    resolvedHost: Schema.String,
+  },
+) {
+  get detail(): string {
+    return `This URL names ${this.requestedHost}, but GitLab CLI resolved the project on ${this.resolvedHost}. Run \`glab config set host ${this.requestedHost}\` and retry, or enter the project path to use ${this.resolvedHost}.`;
+  }
+
+  override get message(): string {
+    return `GitLab CLI failed in ${this.operation}: ${this.detail}`;
+  }
+}
+
 export const GitLabCliError = Schema.Union([
   GitLabCliUnavailableError,
   GitLabCliAuthenticationError,
@@ -235,6 +254,7 @@ export const GitLabCliError = Schema.Union([
   GitLabMergeRequestDecodeError,
   GitLabRepositoryDecodeError,
   GitLabNamespaceDecodeError,
+  GitLabRepositoryHostMismatchError,
 ]);
 export type GitLabCliError = typeof GitLabCliError.Type;
 export const isGitLabCliError = Schema.is(GitLabCliError);
@@ -400,10 +420,17 @@ function decodePathname(pathname: string): string {
   }
 }
 
-// `glab api projects/:path` addresses a project by its namespace path on one host, so a repository
-// pasted as a web or clone URL has to be split into both first. Without the host the path alone
-// would be looked up on whichever host `glab` defaults to, which can resolve a same-named project
-// on the wrong instance. A bare path carries no host and keeps that default.
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url).host.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+// `glab api projects/:path` addresses a project by its namespace path, so a repository pasted as a
+// web or clone URL has to be reduced to that path first. The host the URL named is kept so the
+// resolved project can be checked against it; a bare path names no host and needs no check.
 function parseProjectTarget(repository: string): {
   readonly host: string | null;
   readonly path: string;
@@ -415,8 +442,11 @@ function parseProjectTarget(repository: string): {
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
     try {
       const url = new URL(trimmed);
-      // Port kept for web URLs, where it belongs to the API, and dropped for ssh, where it does not.
-      host = url.protocol === "http:" || url.protocol === "https:" ? url.host : url.hostname;
+      // Port kept for web URLs, where it is part of the address, and dropped for ssh, where it
+      // belongs to the ssh endpoint rather than the one the project is served from.
+      host = (
+        url.protocol === "http:" || url.protocol === "https:" ? url.host : url.hostname
+      ).toLowerCase();
       // `pathname` is percent-encoded, and the caller encodes the path it gets back, so decoding
       // here keeps a pasted URL from being encoded twice.
       path = decodePathname(url.pathname);
@@ -428,7 +458,7 @@ function parseProjectTarget(repository: string): {
     // scp-style, where the user is optional the way `git clone host:group/project.git` allows.
     const scpStyle = /^(?:[^/@\s]+@)?([^:/\s]+):(.+)$/.exec(trimmed);
     if (scpStyle?.[1] !== undefined && scpStyle[2] !== undefined) {
-      host = scpStyle[1];
+      host = scpStyle[1].toLowerCase();
       path = scpStyle[2];
     }
   }
@@ -571,11 +601,7 @@ export const make = Effect.gen(function* () {
       const target = parseProjectTarget(input.repository);
       return execute({
         cwd: input.cwd,
-        args: [
-          "api",
-          ...(target.host === null ? [] : ["--hostname", target.host]),
-          `projects/${encodeURIComponent(target.path)}`,
-        ],
+        args: ["api", `projects/${encodeURIComponent(target.path)}`],
       }).pipe(
         Effect.map((result) => result.stdout.trim()),
         Effect.flatMap((raw) =>
@@ -593,6 +619,24 @@ export const make = Effect.gen(function* () {
           ),
         ),
         Effect.map(normalizeRepositoryCloneUrls),
+        // The lookup runs on whichever host `glab` is signed in to, so a URL naming another
+        // instance would otherwise resolve a same-named project on the wrong one.
+        Effect.tap((urls) => {
+          const resolvedHost = hostOf(urls.url);
+          if (target.host === null || resolvedHost === null || resolvedHost === target.host) {
+            return Effect.void;
+          }
+
+          return Effect.fail(
+            new GitLabRepositoryHostMismatchError({
+              command: "glab",
+              cwd: input.cwd,
+              operation: "getRepositoryCloneUrls",
+              requestedHost: target.host,
+              resolvedHost,
+            }),
+          );
+        }),
       );
     },
     createRepository: (input) => {

@@ -184,7 +184,7 @@ layer("GitLabCli.layer", (it) => {
     }),
   );
 
-  it.effect("looks repositories up by the host and project path a URL names", () =>
+  it.effect("reduces a repository given as a URL to the project path it names", () =>
     Effect.gen(function* () {
       const repositoryJson = `{
         "path_with_namespace": "group/subgroup/project",
@@ -192,37 +192,24 @@ layer("GitLabCli.layer", (it) => {
         "http_url_to_repo": "https://sourcecontrol.example.com/group/subgroup/project.git",
         "ssh_url_to_repo": "git@sourcecontrol.example.com:group/subgroup/project.git"
       }`;
-      const onHost = [
-        "--hostname",
-        "sourcecontrol.example.com",
-        "projects/group%2Fsubgroup%2Fproject",
-      ];
+      const project = "projects/group%2Fsubgroup%2Fproject";
 
-      const cases: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
-        ["https://sourcecontrol.example.com/group/subgroup/project", onHost],
-        ["https://sourcecontrol.example.com/group/subgroup/project.git", onHost],
-        ["https://sourcecontrol.example.com/group/subgroup/project/-/tree/main", onHost],
-        ["https://sourcecontrol.example.com/group/subgroup/project?ref_type=heads", onHost],
-        ["git@sourcecontrol.example.com:group/subgroup/project.git", onHost],
-        ["sourcecontrol.example.com:group/subgroup/project.git", onHost],
-        // The ssh port is not the API's, so it is dropped; a web port is kept.
-        ["ssh://git@sourcecontrol.example.com:22/group/subgroup/project.git", onHost],
-        [
-          "https://sourcecontrol.example.com:8443/group/subgroup/project",
-          ["--hostname", "sourcecontrol.example.com:8443", "projects/group%2Fsubgroup%2Fproject"],
-        ],
+      const cases: ReadonlyArray<readonly [string, string]> = [
+        ["https://sourcecontrol.example.com/group/subgroup/project", project],
+        ["https://sourcecontrol.example.com/group/subgroup/project.git", project],
+        ["https://sourcecontrol.example.com/group/subgroup/project/-/tree/main", project],
+        ["https://sourcecontrol.example.com/group/subgroup/project?ref_type=heads", project],
+        ["git@sourcecontrol.example.com:group/subgroup/project.git", project],
+        ["sourcecontrol.example.com:group/subgroup/project.git", project],
+        ["ssh://git@sourcecontrol.example.com:22/group/subgroup/project.git", project],
         // A pasted URL arrives percent-encoded, so the path is decoded before it is encoded again.
         [
           "https://sourcecontrol.example.com/group/subgroup/pro%2Dject",
-          ["--hostname", "sourcecontrol.example.com", "projects/group%2Fsubgroup%2Fpro-ject"],
+          "projects/group%2Fsubgroup%2Fpro-ject",
         ],
         // Malformed escapes name no project, so the raw path stands rather than throwing.
-        [
-          "https://sourcecontrol.example.com/group/pro%ZZject",
-          ["--hostname", "sourcecontrol.example.com", "projects/group%2Fpro%25ZZject"],
-        ],
-        // A bare path names no host, so `glab` keeps resolving it against its own default.
-        ["group/subgroup/project", ["projects/group%2Fsubgroup%2Fproject"]],
+        ["https://sourcecontrol.example.com/group/pro%ZZject", "projects/group%2Fpro%25ZZject"],
+        ["group/subgroup/project", project],
       ];
 
       const sent: Array<readonly [string, ReadonlyArray<string> | undefined]> = [];
@@ -236,8 +223,35 @@ layer("GitLabCli.layer", (it) => {
 
       assert.deepStrictEqual(
         sent,
-        cases.map(([repository, expectedArgs]) => [repository, ["api", ...expectedArgs]]),
+        cases.map(([repository, path]) => [repository, ["api", path]]),
       );
+    }),
+  );
+
+  it.effect("refuses a project resolved on a host the URL did not name", () =>
+    Effect.gen(function* () {
+      mockedRun.mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(`{
+            "path_with_namespace": "group/project",
+            "web_url": "https://gitlab.com/group/project",
+            "http_url_to_repo": "https://gitlab.com/group/project.git",
+            "ssh_url_to_repo": "git@gitlab.com:group/project.git"
+          }`),
+        ),
+      );
+
+      const error = yield* Effect.gen(function* () {
+        const glab = yield* GitLabCli.GitLabCli;
+        return yield* glab.getRepositoryCloneUrls({
+          cwd: "/repo",
+          repository: "https://sourcecontrol.example.com/group/project",
+        });
+      }).pipe(Effect.flip);
+
+      assert.strictEqual(error._tag, "GitLabRepositoryHostMismatchError");
+      assert.equal(error.detail.includes("sourcecontrol.example.com"), true);
+      assert.equal(error.detail.includes("gitlab.com"), true);
     }),
   );
 
