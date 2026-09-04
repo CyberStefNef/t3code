@@ -415,29 +415,20 @@ function decodePathname(pathname: string): string {
   try {
     return decodeURIComponent(pathname);
   } catch {
-    // Malformed escapes are not a project path either way, so the raw pathname stands.
     return pathname;
   }
 }
 
-// A GitLab installed under a relative URL root serves its projects below that prefix, so the
-// prefix is part of the pasted URL but not part of the project path the API takes.
 function stripSubfolder(path: string, subfolder: string): string {
   if (subfolder.length === 0) return path;
 
   const prefix = `${subfolder.toLowerCase()}/`;
   if (!path.toLowerCase().startsWith(prefix)) return path;
 
-  // A project path is a namespace and a project at the least, so a prefix that would leave one
-  // segment is naming that project's own group rather than an install root.
   const stripped = path.slice(prefix.length);
   return stripped.includes("/") ? stripped : path;
 }
 
-// `glab config get host` answers with whatever the user configured, which may be a bare hostname,
-// or a URL carrying the scheme and the relative root, as `GITLAB_HOST=https://example.com/gitlab`
-// does. Only the path part names the root, and it names it for that host alone, so a URL pointing
-// somewhere else keeps its own leading segment.
 function relativeRootOf(configuredHost: string, address: string): string {
   const value = configuredHost.trim();
   if (value.length === 0) return "";
@@ -465,9 +456,6 @@ function webAddressOf(url: string): { readonly hostname: string; readonly port: 
   }
 }
 
-// `glab api projects/:path` addresses a project by its namespace path, so a repository pasted as a
-// web or clone URL has to be reduced to that path first. The host the URL named is kept so the
-// resolved project can be checked against it; a bare path names no host and needs no check.
 function parseProjectTarget(repository: string): {
   readonly host: string | null;
   readonly port: string;
@@ -482,18 +470,13 @@ function parseProjectTarget(repository: string): {
     try {
       const url = new URL(trimmed);
       host = url.hostname.toLowerCase();
-      // Only a web URL states the port the project is served from. An ssh remote's port belongs
-      // to its own endpoint, so it is left out rather than compared against the API's.
       port = url.protocol === "http:" || url.protocol === "https:" ? url.port : "";
-      // `pathname` is percent-encoded, and the caller encodes the path it gets back, so decoding
-      // here keeps a pasted URL from being encoded twice.
       path = decodePathname(url.pathname);
     } catch {
       host = null;
       path = trimmed;
     }
   } else {
-    // scp-style, where the user is optional the way `git clone host:group/project.git` allows.
     const scpStyle = /^(?:[^/@\s]+@)?([^:/\s]+):(.+)$/.exec(trimmed);
     if (scpStyle?.[1] !== undefined && scpStyle[2] !== undefined) {
       host = scpStyle[1].toLowerCase();
@@ -501,7 +484,6 @@ function parseProjectTarget(repository: string): {
     }
   }
 
-  // GitLab hangs everything below a project off `/-/`, so a deeper URL still names its project.
   const [beforeProjectContent] = path.split("/-/");
   const normalized = (beforeProjectContent ?? path)
     .replace(/^\/+|\/+$/g, "")
@@ -639,23 +621,17 @@ export const make = Effect.gen(function* () {
       ),
     getRepositoryCloneUrls: (input) => {
       const target = parseProjectTarget(input.repository);
-      // Only a URL can carry the prefix, and reading it is a local config lookup rather than a
-      // request, so a bare path skips it.
       const readConfig = (args: ReadonlyArray<string>) =>
         execute({ cwd: input.cwd, args: ["config", "get", ...args] }).pipe(
           Effect.map((result) => result.stdout.trim()),
           Effect.orElseSucceed(() => ""),
         );
-      // Per-host settings are keyed by the address as configured, port included, so an instance
-      // on a non-default port is asked for under that same address.
       const address = target.host === null ? "" : withPort(target.host, target.port);
       const subfolder =
         target.host === null
           ? Effect.succeed("")
           : readConfig(["subfolder", "--host", address]).pipe(
               Effect.map((configured) => configured.replace(/^\/+|\/+$/g, "")),
-              // The key is only set when `glab auth login` was told about the root. A host given
-              // as a URL carries it in the path instead, so that is where it is read from next.
               Effect.flatMap((configured) =>
                 configured.length > 0
                   ? Effect.succeed(configured)
@@ -688,13 +664,9 @@ export const make = Effect.gen(function* () {
           ),
         ),
         Effect.map(normalizeRepositoryCloneUrls),
-        // The lookup runs on whichever host `glab` is signed in to, so a URL naming another
-        // instance would otherwise resolve a same-named project on the wrong one.
         Effect.tap((urls) => {
           const resolved = webAddressOf(urls.url);
           if (target.host === null || resolved === null) return Effect.void;
-          // A stated port names one server among several a hostname may serve, so it is compared
-          // when the URL gave one and ignored when it did not.
           const sameServer =
             resolved.hostname === target.host &&
             (target.port === "" || target.port === resolved.port);

@@ -29,8 +29,6 @@ function processOutput(stdout: string): VcsProcess.VcsProcessOutput {
   };
 }
 
-// A URL lookup reads the host's relative URL root before it asks for the project, so both
-// answers are dispatched on the subcommand rather than queued in order.
 function mockRepository(
   repositoryJson: string,
   config: { readonly subfolder?: string; readonly host?: string } = {},
@@ -200,12 +198,14 @@ layer("GitLabCli.layer", (it) => {
 
   it.effect("reduces a repository given as a URL to the project path it names", () =>
     Effect.gen(function* () {
-      const repositoryJson = `{
-        "path_with_namespace": "group/subgroup/project",
-        "web_url": "https://sourcecontrol.example.com/group/subgroup/project",
-        "http_url_to_repo": "https://sourcecontrol.example.com/group/subgroup/project.git",
-        "ssh_url_to_repo": "git@sourcecontrol.example.com:group/subgroup/project.git"
-      }`;
+      const repositoryJson =
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify({
+          path_with_namespace: "group/subgroup/project",
+          web_url: "https://sourcecontrol.example.com/group/subgroup/project",
+          http_url_to_repo: "https://sourcecontrol.example.com/group/subgroup/project.git",
+          ssh_url_to_repo: "git@sourcecontrol.example.com:group/subgroup/project.git",
+        });
       const project = "projects/group%2Fsubgroup%2Fproject";
 
       const cases: ReadonlyArray<readonly [string, string]> = [
@@ -216,17 +216,14 @@ layer("GitLabCli.layer", (it) => {
         ["git@sourcecontrol.example.com:group/subgroup/project.git", project],
         ["sourcecontrol.example.com:group/subgroup/project.git", project],
         ["ssh://git@sourcecontrol.example.com:22/group/subgroup/project.git", project],
-        // A pasted URL arrives percent-encoded, so the path is decoded before it is encoded again.
         [
           "https://sourcecontrol.example.com/group/subgroup/pro%2Dject",
           "projects/group%2Fsubgroup%2Fpro-ject",
         ],
-        // Malformed escapes name no project, so the raw path stands rather than throwing.
         ["https://sourcecontrol.example.com/group/pro%ZZject", "projects/group%2Fpro%25ZZject"],
         ["group/subgroup/project", project],
       ];
 
-      // No relative URL root configured, so the path is asked for as it was parsed.
       mockRepository(repositoryJson);
 
       const sent: Array<readonly [string, ReadonlyArray<string> | undefined]> = [];
@@ -246,12 +243,13 @@ layer("GitLabCli.layer", (it) => {
   it.effect("drops the relative URL root of an instance hosted under a subfolder", () =>
     Effect.gen(function* () {
       mockRepository(
-        `{
-          "path_with_namespace": "group/project",
-          "web_url": "https://example.com/gitlab/group/project",
-          "http_url_to_repo": "https://example.com/gitlab/group/project.git",
-          "ssh_url_to_repo": "git@example.com:group/project.git"
-        }`,
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify({
+          path_with_namespace: "group/project",
+          web_url: "https://example.com/gitlab/group/project",
+          http_url_to_repo: "https://example.com/gitlab/group/project.git",
+          ssh_url_to_repo: "git@example.com:group/project.git",
+        }),
         { subfolder: "gitlab" },
       );
 
@@ -278,16 +276,15 @@ layer("GitLabCli.layer", (it) => {
 
   it.effect("reads the relative URL root from a host configured with or without a scheme", () =>
     Effect.gen(function* () {
-      // `glab config get host` answers with whatever was configured: a bare host and root, or the
-      // whole URL, as `GITLAB_HOST=https://example.com/gitlab` gives.
       for (const host of ["example.com/gitlab", "https://example.com/gitlab"]) {
         mockRepository(
-          `{
-            "path_with_namespace": "group/subgroup/project",
-            "web_url": "https://example.com/gitlab/group/subgroup/project",
-            "http_url_to_repo": "https://example.com/gitlab/group/subgroup/project.git",
-            "ssh_url_to_repo": "git@example.com:group/subgroup/project.git"
-          }`,
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
+          JSON.stringify({
+            path_with_namespace: "group/subgroup/project",
+            web_url: "https://example.com/gitlab/group/subgroup/project",
+            http_url_to_repo: "https://example.com/gitlab/group/subgroup/project.git",
+            ssh_url_to_repo: "git@example.com:group/subgroup/project.git",
+          }),
           { host },
         );
 
@@ -310,12 +307,13 @@ layer("GitLabCli.layer", (it) => {
   it.effect("reads the relative URL root under the port the instance is served on", () =>
     Effect.gen(function* () {
       mockRepository(
-        `{
-          "path_with_namespace": "group/project",
-          "web_url": "https://example.com:8443/gitlab/group/project",
-          "http_url_to_repo": "https://example.com:8443/gitlab/group/project.git",
-          "ssh_url_to_repo": "git@example.com:group/project.git"
-        }`,
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify({
+          path_with_namespace: "group/project",
+          web_url: "https://example.com:8443/gitlab/group/project",
+          http_url_to_repo: "https://example.com:8443/gitlab/group/project.git",
+          ssh_url_to_repo: "git@example.com:group/project.git",
+        }),
         { subfolder: "gitlab" },
       );
 
@@ -325,7 +323,6 @@ layer("GitLabCli.layer", (it) => {
         repository: "https://example.com:8443/gitlab/group/project",
       });
 
-      // `glab` keys per-host settings by the configured address, so the port belongs in the ask.
       assert.deepStrictEqual(mockedRun.mock.calls[0]?.[0].args, [
         "config",
         "get",
@@ -343,13 +340,13 @@ layer("GitLabCli.layer", (it) => {
   it.effect("keeps a leading segment when the configured root belongs to another host", () =>
     Effect.gen(function* () {
       mockRepository(
-        `{
-          "path_with_namespace": "gitlab/group/project",
-          "web_url": "https://gitlab.com/gitlab/group/project",
-          "http_url_to_repo": "https://gitlab.com/gitlab/group/project.git",
-          "ssh_url_to_repo": "git@gitlab.com:gitlab/group/project.git"
-        }`,
-        // The relative root belongs to example.com, so a gitlab.com path keeps its own `gitlab/`.
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify({
+          path_with_namespace: "gitlab/group/project",
+          web_url: "https://gitlab.com/gitlab/group/project",
+          http_url_to_repo: "https://gitlab.com/gitlab/group/project.git",
+          ssh_url_to_repo: "git@gitlab.com:gitlab/group/project.git",
+        }),
         { host: "https://example.com/gitlab" },
       );
 
@@ -370,13 +367,13 @@ layer("GitLabCli.layer", (it) => {
   it.effect("keeps a root that would leave a project without its namespace", () =>
     Effect.gen(function* () {
       mockRepository(
-        `{
-          "path_with_namespace": "group/project",
-          "web_url": "https://example.com/group/project",
-          "http_url_to_repo": "https://example.com/group/project.git",
-          "ssh_url_to_repo": "git@example.com:group/project.git"
-        }`,
-        // `group` is the project's own namespace here, not an install root.
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify({
+          path_with_namespace: "group/project",
+          web_url: "https://example.com/group/project",
+          http_url_to_repo: "https://example.com/group/project.git",
+          ssh_url_to_repo: "git@example.com:group/project.git",
+        }),
         { subfolder: "group" },
       );
 
@@ -395,12 +392,15 @@ layer("GitLabCli.layer", (it) => {
 
   it.effect("asks for a bare project path without reading any config", () =>
     Effect.gen(function* () {
-      mockRepository(`{
-        "path_with_namespace": "group/subgroup/project",
-        "web_url": "https://gitlab.com/group/subgroup/project",
-        "http_url_to_repo": "https://gitlab.com/group/subgroup/project.git",
-        "ssh_url_to_repo": "git@gitlab.com:group/subgroup/project.git"
-      }`);
+      mockRepository(
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify({
+          path_with_namespace: "group/subgroup/project",
+          web_url: "https://gitlab.com/group/subgroup/project",
+          http_url_to_repo: "https://gitlab.com/group/subgroup/project.git",
+          ssh_url_to_repo: "git@gitlab.com:group/subgroup/project.git",
+        }),
+      );
 
       const glab = yield* GitLabCli.GitLabCli;
       yield* glab.getRepositoryCloneUrls({ cwd: "/repo", repository: "group/subgroup/project" });
@@ -414,17 +414,19 @@ layer("GitLabCli.layer", (it) => {
 
   it.effect("accepts a project served on a non-default port", () =>
     Effect.gen(function* () {
-      mockRepository(`{
-            "path_with_namespace": "group/project",
-            "web_url": "https://sourcecontrol.example.com:8443/group/project",
-            "http_url_to_repo": "https://sourcecontrol.example.com:8443/group/project.git",
-            "ssh_url_to_repo": "git@sourcecontrol.example.com:group/project.git"
-          }`);
+      mockRepository(
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify({
+          path_with_namespace: "group/project",
+          web_url: "https://sourcecontrol.example.com:8443/group/project",
+          http_url_to_repo: "https://sourcecontrol.example.com:8443/group/project.git",
+          ssh_url_to_repo: "git@sourcecontrol.example.com:group/project.git",
+        }),
+      );
 
       const glab = yield* GitLabCli.GitLabCli;
       const urls = yield* glab.getRepositoryCloneUrls({
         cwd: "/repo",
-        // An ssh remote never carries the web port, so the check has to compare without it.
         repository: "git@sourcecontrol.example.com:group/project.git",
       });
 
@@ -434,12 +436,15 @@ layer("GitLabCli.layer", (it) => {
 
   it.effect("refuses a project served on a different port than the URL named", () =>
     Effect.gen(function* () {
-      mockRepository(`{
-        "path_with_namespace": "group/project",
-        "web_url": "https://sourcecontrol.example.com/group/project",
-        "http_url_to_repo": "https://sourcecontrol.example.com/group/project.git",
-        "ssh_url_to_repo": "git@sourcecontrol.example.com:group/project.git"
-      }`);
+      mockRepository(
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify({
+          path_with_namespace: "group/project",
+          web_url: "https://sourcecontrol.example.com/group/project",
+          http_url_to_repo: "https://sourcecontrol.example.com/group/project.git",
+          ssh_url_to_repo: "git@sourcecontrol.example.com:group/project.git",
+        }),
+      );
 
       const error = yield* Effect.gen(function* () {
         const glab = yield* GitLabCli.GitLabCli;
@@ -456,12 +461,15 @@ layer("GitLabCli.layer", (it) => {
 
   it.effect("refuses a project resolved on a host the URL did not name", () =>
     Effect.gen(function* () {
-      mockRepository(`{
-            "path_with_namespace": "group/project",
-            "web_url": "https://gitlab.com/group/project",
-            "http_url_to_repo": "https://gitlab.com/group/project.git",
-            "ssh_url_to_repo": "git@gitlab.com:group/project.git"
-          }`);
+      mockRepository(
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify({
+          path_with_namespace: "group/project",
+          web_url: "https://gitlab.com/group/project",
+          http_url_to_repo: "https://gitlab.com/group/project.git",
+          ssh_url_to_repo: "git@gitlab.com:group/project.git",
+        }),
+      );
 
       const error = yield* Effect.gen(function* () {
         const glab = yield* GitLabCli.GitLabCli;
