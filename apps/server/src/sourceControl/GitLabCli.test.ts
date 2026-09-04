@@ -340,6 +340,59 @@ layer("GitLabCli.layer", (it) => {
     }),
   );
 
+  it.effect("keeps a leading segment when the configured root belongs to another host", () =>
+    Effect.gen(function* () {
+      mockRepository(
+        `{
+          "path_with_namespace": "gitlab/group/project",
+          "web_url": "https://gitlab.com/gitlab/group/project",
+          "http_url_to_repo": "https://gitlab.com/gitlab/group/project.git",
+          "ssh_url_to_repo": "git@gitlab.com:gitlab/group/project.git"
+        }`,
+        // The relative root belongs to example.com, so a gitlab.com path keeps its own `gitlab/`.
+        { host: "https://example.com/gitlab" },
+      );
+
+      const glab = yield* GitLabCli.GitLabCli;
+      const urls = yield* glab.getRepositoryCloneUrls({
+        cwd: "/repo",
+        repository: "https://gitlab.com/gitlab/group/project",
+      });
+
+      assert.deepStrictEqual(mockedRun.mock.lastCall?.[0].args, [
+        "api",
+        "projects/gitlab%2Fgroup%2Fproject",
+      ]);
+      assert.strictEqual(urls.nameWithOwner, "gitlab/group/project");
+    }),
+  );
+
+  it.effect("keeps a root that would leave a project without its namespace", () =>
+    Effect.gen(function* () {
+      mockRepository(
+        `{
+          "path_with_namespace": "group/project",
+          "web_url": "https://example.com/group/project",
+          "http_url_to_repo": "https://example.com/group/project.git",
+          "ssh_url_to_repo": "git@example.com:group/project.git"
+        }`,
+        // `group` is the project's own namespace here, not an install root.
+        { subfolder: "group" },
+      );
+
+      const glab = yield* GitLabCli.GitLabCli;
+      yield* glab.getRepositoryCloneUrls({
+        cwd: "/repo",
+        repository: "https://example.com/group/project",
+      });
+
+      assert.deepStrictEqual(mockedRun.mock.lastCall?.[0].args, [
+        "api",
+        "projects/group%2Fproject",
+      ]);
+    }),
+  );
+
   it.effect("asks for a bare project path without reading any config", () =>
     Effect.gen(function* () {
       mockRepository(`{

@@ -426,21 +426,27 @@ function stripSubfolder(path: string, subfolder: string): string {
   if (subfolder.length === 0) return path;
 
   const prefix = `${subfolder.toLowerCase()}/`;
-  return path.toLowerCase().startsWith(prefix) && path.length > prefix.length
-    ? path.slice(prefix.length)
-    : path;
+  if (!path.toLowerCase().startsWith(prefix)) return path;
+
+  // A project path is a namespace and a project at the least, so a prefix that would leave one
+  // segment is naming that project's own group rather than an install root.
+  const stripped = path.slice(prefix.length);
+  return stripped.includes("/") ? stripped : path;
 }
 
 // `glab config get host` answers with whatever the user configured, which may be a bare hostname,
 // or a URL carrying the scheme and the relative root, as `GITLAB_HOST=https://example.com/gitlab`
-// does. Only the path part names the root.
-function relativeRootOf(configuredHost: string): string {
+// does. Only the path part names the root, and it names it for that host alone, so a URL pointing
+// somewhere else keeps its own leading segment.
+function relativeRootOf(configuredHost: string, address: string): string {
   const value = configuredHost.trim();
   if (value.length === 0) return "";
 
   const addressed = /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`;
   try {
-    return new URL(addressed).pathname.replace(/^\/+|\/+$/g, "");
+    const url = new URL(addressed);
+    if (withPort(url.hostname.toLowerCase(), url.port) !== address) return "";
+    return url.pathname.replace(/^\/+|\/+$/g, "");
   } catch {
     return "";
   }
@@ -640,19 +646,22 @@ export const make = Effect.gen(function* () {
           Effect.map((result) => result.stdout.trim()),
           Effect.orElseSucceed(() => ""),
         );
+      // Per-host settings are keyed by the address as configured, port included, so an instance
+      // on a non-default port is asked for under that same address.
+      const address = target.host === null ? "" : withPort(target.host, target.port);
       const subfolder =
         target.host === null
           ? Effect.succeed("")
-          : // Per-host settings are keyed by the address as configured, port included, so an
-            // instance on a non-default port is asked for under that same address.
-            readConfig(["subfolder", "--host", withPort(target.host, target.port)]).pipe(
+          : readConfig(["subfolder", "--host", address]).pipe(
               Effect.map((configured) => configured.replace(/^\/+|\/+$/g, "")),
               // The key is only set when `glab auth login` was told about the root. A host given
               // as a URL carries it in the path instead, so that is where it is read from next.
               Effect.flatMap((configured) =>
                 configured.length > 0
                   ? Effect.succeed(configured)
-                  : readConfig(["host"]).pipe(Effect.map(relativeRootOf)),
+                  : readConfig(["host"]).pipe(
+                      Effect.map((configured) => relativeRootOf(configured, address)),
+                    ),
               ),
             );
 
