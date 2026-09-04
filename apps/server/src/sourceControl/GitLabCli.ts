@@ -420,9 +420,20 @@ function decodePathname(pathname: string): string {
   }
 }
 
-function hostOf(url: string): string | null {
+// A GitLab installed under a relative URL root serves its projects below that prefix, so the
+// prefix is part of the pasted URL but not part of the project path the API takes.
+function stripSubfolder(path: string, subfolder: string): string {
+  if (subfolder.length === 0) return path;
+
+  const prefix = `${subfolder.toLowerCase()}/`;
+  return path.toLowerCase().startsWith(prefix) && path.length > prefix.length
+    ? path.slice(prefix.length)
+    : path;
+}
+
+function hostnameOf(url: string): string | null {
   try {
-    return new URL(url).host.toLowerCase();
+    return new URL(url).hostname.toLowerCase();
   } catch {
     return null;
   }
@@ -442,11 +453,9 @@ function parseProjectTarget(repository: string): {
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
     try {
       const url = new URL(trimmed);
-      // Port kept for web URLs, where it is part of the address, and dropped for ssh, where it
-      // belongs to the ssh endpoint rather than the one the project is served from.
-      host = (
-        url.protocol === "http:" || url.protocol === "https:" ? url.host : url.hostname
-      ).toLowerCase();
+      // Compared without the port, which an ssh remote never carries and a web URL may, so the
+      // two shapes of the same instance still agree.
+      host = url.hostname.toLowerCase();
       // `pathname` is percent-encoded, and the caller encodes the path it gets back, so decoding
       // here keeps a pasted URL from being encoded twice.
       path = decodePathname(url.pathname);
@@ -599,10 +608,26 @@ export const make = Effect.gen(function* () {
       ),
     getRepositoryCloneUrls: (input) => {
       const target = parseProjectTarget(input.repository);
-      return execute({
-        cwd: input.cwd,
-        args: ["api", `projects/${encodeURIComponent(target.path)}`],
-      }).pipe(
+      // Only a URL can carry the prefix, and reading it is a local config lookup rather than a
+      // request, so a bare path skips it.
+      const subfolder =
+        target.host === null
+          ? Effect.succeed("")
+          : execute({
+              cwd: input.cwd,
+              args: ["config", "get", "subfolder", "--host", target.host],
+            }).pipe(
+              Effect.map((result) => result.stdout.trim().replace(/^\/+|\/+$/g, "")),
+              Effect.orElseSucceed(() => ""),
+            );
+
+      return subfolder.pipe(
+        Effect.flatMap((prefix) =>
+          execute({
+            cwd: input.cwd,
+            args: ["api", `projects/${encodeURIComponent(stripSubfolder(target.path, prefix))}`],
+          }),
+        ),
         Effect.map((result) => result.stdout.trim()),
         Effect.flatMap((raw) =>
           decodeGitLabRepositoryCloneUrls(raw).pipe(
@@ -622,7 +647,7 @@ export const make = Effect.gen(function* () {
         // The lookup runs on whichever host `glab` is signed in to, so a URL naming another
         // instance would otherwise resolve a same-named project on the wrong one.
         Effect.tap((urls) => {
-          const resolvedHost = hostOf(urls.url);
+          const resolvedHost = hostnameOf(urls.url);
           if (target.host === null || resolvedHost === null || resolvedHost === target.host) {
             return Effect.void;
           }
