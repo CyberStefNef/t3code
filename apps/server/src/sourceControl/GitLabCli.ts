@@ -422,8 +422,8 @@ function decodePathname(pathname: string): string {
 function stripSubfolder(path: string, subfolder: string): string {
   if (subfolder.length === 0) return path;
 
-  const prefix = `${subfolder.toLowerCase()}/`;
-  if (!path.toLowerCase().startsWith(prefix)) return path;
+  const prefix = `${subfolder}/`;
+  if (!path.toLowerCase().startsWith(prefix.toLowerCase())) return path;
 
   const stripped = path.slice(prefix.length);
   return stripped.includes("/") ? stripped : path;

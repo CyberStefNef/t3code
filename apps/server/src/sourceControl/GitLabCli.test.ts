@@ -304,6 +304,32 @@ layer("GitLabCli.layer", (it) => {
     }),
   );
 
+  it.effect("strips an installation root whose lowercase spelling changes length", () =>
+    Effect.gen(function* () {
+      mockRepository(
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify({
+          path_with_namespace: "group/project",
+          web_url: "https://example.com/İ/group/project",
+          http_url_to_repo: "https://example.com/İ/group/project.git",
+          ssh_url_to_repo: "git@example.com:group/project.git",
+        }),
+        { subfolder: "İ" },
+      );
+
+      const glab = yield* GitLabCli.GitLabCli;
+      yield* glab.getRepositoryCloneUrls({
+        cwd: "/repo",
+        repository: "https://example.com/İ/group/project",
+      });
+
+      assert.deepStrictEqual(mockedRun.mock.lastCall?.[0].args, [
+        "api",
+        "projects/group%2Fproject",
+      ]);
+    }),
+  );
+
   it.effect("reads the relative URL root under the port the instance is served on", () =>
     Effect.gen(function* () {
       mockRepository(
