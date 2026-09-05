@@ -458,19 +458,19 @@ function webAddressOf(url: string): { readonly hostname: string; readonly port: 
 
 function parseProjectTarget(repository: string): {
   readonly host: string | null;
-  readonly port: string;
+  readonly port: string | null;
   readonly path: string;
 } {
   const trimmed = repository.trim();
   let host: string | null = null;
-  let port = "";
+  let port: string | null = null;
   let path = trimmed;
 
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
     try {
       const url = new URL(trimmed);
       host = url.hostname.toLowerCase();
-      port = url.protocol === "http:" || url.protocol === "https:" ? url.port : "";
+      port = url.protocol === "http:" || url.protocol === "https:" ? url.port : null;
       path = decodePathname(url.pathname);
     } catch {
       host = null;
@@ -490,7 +490,7 @@ function parseProjectTarget(repository: string): {
     .replace(/\.git$/i, "");
   return normalized.length > 0
     ? { host, port, path: normalized }
-    : { host: null, port: "", path: trimmed };
+    : { host: null, port: null, path: trimmed };
 }
 
 function parseRepositoryPath(repository: string): {
@@ -626,7 +626,7 @@ export const make = Effect.gen(function* () {
           Effect.map((result) => result.stdout.trim()),
           Effect.orElseSucceed(() => ""),
         );
-      const address = target.host === null ? "" : withPort(target.host, target.port);
+      const address = target.host === null ? "" : withPort(target.host, target.port ?? "");
       const subfolder =
         target.host === null
           ? Effect.succeed("")
@@ -669,7 +669,7 @@ export const make = Effect.gen(function* () {
           if (target.host === null || resolved === null) return Effect.void;
           const sameServer =
             resolved.hostname === target.host &&
-            (target.port === "" || target.port === resolved.port);
+            (target.port === null || target.port === resolved.port);
           if (sameServer) return Effect.void;
 
           return Effect.fail(
@@ -677,7 +677,7 @@ export const make = Effect.gen(function* () {
               command: "glab",
               cwd: input.cwd,
               operation: "getRepositoryCloneUrls",
-              requestedHost: withPort(target.host, target.port),
+              requestedHost: withPort(target.host, target.port ?? ""),
               resolvedHost: withPort(resolved.hostname, resolved.port),
             }),
           );

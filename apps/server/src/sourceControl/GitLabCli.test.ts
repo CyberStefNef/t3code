@@ -459,6 +459,31 @@ layer("GitLabCli.layer", (it) => {
     }),
   );
 
+  it.effect.each([
+    "https://sourcecontrol.example.com/group/project",
+    "https://sourcecontrol.example.com:443/group/project",
+  ])("does not treat the default web port as a wildcard: %s", (repository) =>
+    Effect.gen(function* () {
+      mockRepository(
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        JSON.stringify({
+          path_with_namespace: "group/project",
+          web_url: "https://sourcecontrol.example.com:8443/group/project",
+          http_url_to_repo: "https://sourcecontrol.example.com:8443/group/project.git",
+          ssh_url_to_repo: "git@sourcecontrol.example.com:group/project.git",
+        }),
+      );
+
+      const error = yield* Effect.gen(function* () {
+        const glab = yield* GitLabCli.GitLabCli;
+        return yield* glab.getRepositoryCloneUrls({ cwd: "/repo", repository });
+      }).pipe(Effect.flip);
+
+      assert.strictEqual(error._tag, "GitLabRepositoryHostMismatchError");
+      assert.equal(error.detail.includes("sourcecontrol.example.com:8443"), true);
+    }),
+  );
+
   it.effect("refuses a project resolved on a host the URL did not name", () =>
     Effect.gen(function* () {
       mockRepository(
