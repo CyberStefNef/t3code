@@ -108,10 +108,16 @@ describe("ProjectCloneTracker", () => {
 
   it.effect("keeps a failed clone with git's own explanation and retries it", () => {
     let attempts = 0;
+    const cloneInputs: Array<
+      Parameters<
+        SourceControlRepositoryService.SourceControlRepositoryService["Service"]["cloneRepository"]
+      >[0]
+    > = [];
     const harness = makeHarness({
       clone: (input) =>
         Effect.suspend(() => {
           attempts += 1;
+          cloneInputs.push(input);
           return attempts === 1
             ? Effect.fail(
                 new SourceControlRepositoryError({
@@ -129,7 +135,10 @@ describe("ProjectCloneTracker", () => {
     });
     return Effect.gen(function* () {
       const tracker = yield* ProjectCloneTracker.ProjectCloneTracker;
-      yield* tracker.start(startInput, harness.hooks);
+      yield* tracker.start(
+        { ...startInput, provider: "github", githubAccount: "work-user" },
+        harness.hooks,
+      );
       yield* Effect.yieldNow;
       const failed = yield* tracker.get(projectId);
       expect(failed).toMatchObject({ phase: "failed", error: "fatal: repository not found" });
@@ -140,6 +149,20 @@ describe("ProjectCloneTracker", () => {
       yield* Effect.yieldNow;
       expect((yield* tracker.get(projectId))?.phase).toBe("done");
       expect(attempts).toBe(2);
+      expect(cloneInputs).toEqual([
+        {
+          remoteUrl: startInput.remoteUrl,
+          destinationPath: startInput.destinationPath,
+          provider: "github",
+          githubAccount: "work-user",
+        },
+        {
+          remoteUrl: startInput.remoteUrl,
+          destinationPath: startInput.destinationPath,
+          provider: "github",
+          githubAccount: "work-user",
+        },
+      ]);
     }).pipe(Effect.provide(harness.layer));
   });
 

@@ -25,6 +25,46 @@ export function createSourceControlEnvironmentAtoms<R, E>(
       label: "environment-data:source-control:repository",
       tag: WS_METHODS.sourceControlLookupRepository,
     }),
+    githubAccount: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:source-control:github-account",
+      tag: WS_METHODS.sourceControlGetGitHubAccount,
+    }),
+    setGitHubAccount: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:source-control:set-github-account",
+      tag: WS_METHODS.sourceControlSetGitHubAccount,
+      scheduler: commandScheduler,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId, input }) => `${environmentId}:${input.cwd}`,
+      },
+    }),
+    startGitHubLogin: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:source-control:start-github-login",
+      tag: WS_METHODS.sourceControlStartGitHubLogin,
+      scheduler: commandScheduler,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId }) => environmentId,
+      },
+    }),
+    getGitHubLoginStatus: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:source-control:get-github-login-status",
+      tag: WS_METHODS.sourceControlGetGitHubLoginStatus,
+      scheduler: commandScheduler,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId, input }) => `${environmentId}:${input.loginId}`,
+      },
+    }),
+    logoutGitHubAccount: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:source-control:logout-github-account",
+      tag: WS_METHODS.sourceControlLogoutGitHubAccount,
+      scheduler: commandScheduler,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId, input }) => `${environmentId}:${input.host}:${input.account}`,
+      },
+    }),
     cloneRepository: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:source-control:clone-repository",
       tag: WS_METHODS.sourceControlCloneRepository,

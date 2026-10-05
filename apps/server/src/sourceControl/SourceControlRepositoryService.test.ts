@@ -12,6 +12,7 @@ import { GitCommandError, SourceControlProviderError } from "@t3tools/contracts"
 
 import * as ServerConfig from "../config.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as GitHubCli from "./GitHubCli.ts";
 import type * as SourceControlProvider from "./SourceControlProvider.ts";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
 import * as SourceControlRepositoryService from "./SourceControlRepositoryService.ts";
@@ -57,9 +58,11 @@ function processOutput(): GitVcsDriver.ExecuteGitResult {
 function makeLayer(input: {
   readonly provider?: SourceControlProvider.SourceControlProvider["Service"];
   readonly git?: Partial<GitVcsDriver.GitVcsDriver["Service"]>;
+  readonly github?: Partial<GitHubCli.GitHubCli["Service"]>;
   readonly fileSystem?: FileSystem.FileSystem;
 }) {
   const serviceLayer = SourceControlRepositoryService.layer.pipe(
+    Layer.provide(Layer.mock(GitHubCli.GitHubCli)(input.github ?? {})),
     Layer.provide(
       Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
         resolveLink: () => undefined,
@@ -96,12 +99,16 @@ function makeLayer(input: {
     : serviceLayer.pipe(Layer.provideMerge(NodeServices.layer));
 }
 
-it.effect("looks up repositories through the requested provider without search", () => {
-  const calls: Array<{ cwd: string; repository: string }> = [];
+it.effect("looks up repositories through the requested provider and GitHub account", () => {
+  const calls: Array<{ cwd: string; repository: string; account?: string }> = [];
   const provider = makeProvider({
     getRepositoryCloneUrls: (input) =>
       Effect.sync(() => {
-        calls.push({ cwd: input.cwd, repository: input.repository });
+        calls.push({
+          cwd: input.cwd,
+          repository: input.repository,
+          ...(input.account ? { account: input.account } : {}),
+        });
         return CLONE_URLS;
       }),
   });
@@ -112,10 +119,13 @@ it.effect("looks up repositories through the requested provider without search",
       provider: "github",
       repository: "octocat/t3code",
       cwd: "/workspace",
+      githubAccount: "work-user",
     });
 
     assert.deepStrictEqual(result, { provider: "github", ...CLONE_URLS });
-    assert.deepStrictEqual(calls, [{ cwd: "/workspace", repository: "octocat/t3code" }]);
+    assert.deepStrictEqual(calls, [
+      { cwd: "/workspace", repository: "octocat/t3code", account: "work-user" },
+    ]);
   }).pipe(Effect.provide(makeLayer({ provider })));
 });
 
@@ -161,6 +171,7 @@ it.effect("clones a looked-up repository into the requested destination", () =>
     });
     const destinationPath = path.join(parent, "t3code");
     const cloneCalls: Array<{ cwd: string; args: ReadonlyArray<string> }> = [];
+    const bindingCalls: Array<{ cwd: string; account: string | null }> = [];
 
     yield* Effect.gen(function* () {
       const service = yield* SourceControlRepositoryService.SourceControlRepositoryService;
@@ -169,6 +180,7 @@ it.effect("clones a looked-up repository into the requested destination", () =>
         repository: "octocat/t3code",
         destinationPath,
         protocol: "https",
+        githubAccount: "work-user",
       });
 
       assert.deepStrictEqual(result, {
@@ -185,6 +197,13 @@ it.effect("clones a looked-up repository into the requested destination", () =>
     }).pipe(
       Effect.provide(
         makeLayer({
+          github: {
+            setAccountBinding: (input) =>
+              Effect.sync(() => {
+                bindingCalls.push(input);
+                return { account: input.account, source: "repository" as const };
+              }),
+          },
           git: {
             execute: (input) =>
               Effect.sync(() => {
@@ -195,6 +214,7 @@ it.effect("clones a looked-up repository into the requested destination", () =>
         }),
       ),
     );
+    assert.deepStrictEqual(bindingCalls, [{ cwd: destinationPath, account: "work-user" }]);
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
@@ -378,8 +398,14 @@ it.effect("preserves destination probe failures instead of treating them as miss
   );
 });
 
-it.effect("publishes by creating the repository, adding a remote, and pushing upstream", () => {
-  const createCalls: Array<{ cwd: string; repository: string; visibility: string }> = [];
+it.effect("pins the GitHub account before creating and publishing the repository", () => {
+  const createCalls: Array<{
+    cwd: string;
+    repository: string;
+    visibility: string;
+    account?: string;
+  }> = [];
+  const bindingCalls: Array<{ cwd: string; account: string | null }> = [];
   const remoteCalls: Array<{ cwd: string; preferredName: string; url: string }> = [];
   const pushCalls: Array<{ cwd: string; remoteName: string | null | undefined }> = [];
   const provider = makeProvider({
@@ -389,6 +415,7 @@ it.effect("publishes by creating the repository, adding a remote, and pushing up
           cwd: input.cwd,
           repository: input.repository,
           visibility: input.visibility,
+          ...(input.account ? { account: input.account } : {}),
         });
         return CLONE_URLS;
       }),
@@ -403,6 +430,7 @@ it.effect("publishes by creating the repository, adding a remote, and pushing up
       visibility: "private",
       remoteName: "origin",
       protocol: "ssh",
+      githubAccount: "work-user",
     });
 
     assert.deepStrictEqual(result, {
@@ -414,8 +442,14 @@ it.effect("publishes by creating the repository, adding a remote, and pushing up
       status: "pushed",
     });
     assert.deepStrictEqual(createCalls, [
-      { cwd: "/workspace", repository: "octocat/t3code", visibility: "private" },
+      {
+        cwd: "/workspace",
+        repository: "octocat/t3code",
+        visibility: "private",
+        account: "work-user",
+      },
     ]);
+    assert.deepStrictEqual(bindingCalls, [{ cwd: "/workspace", account: "work-user" }]);
     assert.deepStrictEqual(remoteCalls, [
       { cwd: "/workspace", preferredName: "origin", url: CLONE_URLS.sshUrl },
     ]);
@@ -424,6 +458,13 @@ it.effect("publishes by creating the repository, adding a remote, and pushing up
     Effect.provide(
       makeLayer({
         provider,
+        github: {
+          setAccountBinding: (input) =>
+            Effect.sync(() => {
+              bindingCalls.push(input);
+              return { account: input.account, source: "repository" as const };
+            }),
+        },
         git: {
           ensureRemote: (input) =>
             Effect.sync(() => {

@@ -257,6 +257,7 @@ export function useSourceControlPublishRepositoryAction(scope: SourceControlActi
       visibility: SourceControlRepositoryVisibility;
       remoteName: string;
       protocol: SourceControlCloneProtocol;
+      githubAccount?: string;
     }) => {
       const target = resolveScope(scope);
       if (target === null) {

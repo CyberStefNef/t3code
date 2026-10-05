@@ -66,6 +66,7 @@ export const SourceControlRepositoryLookupInput = Schema.Struct({
   provider: SourceControlProviderKind,
   repository: TrimmedNonEmptyString,
   cwd: Schema.optional(TrimmedNonEmptyString),
+  githubAccount: Schema.optional(TrimmedNonEmptyString),
 });
 export type SourceControlRepositoryLookupInput = typeof SourceControlRepositoryLookupInput.Type;
 
@@ -75,6 +76,7 @@ export const SourceControlCloneRepositoryInput = Schema.Struct({
   remoteUrl: Schema.optional(TrimmedNonEmptyString),
   destinationPath: TrimmedNonEmptyString,
   protocol: Schema.optional(SourceControlCloneProtocol),
+  githubAccount: Schema.optional(TrimmedNonEmptyString),
 });
 export type SourceControlCloneRepositoryInput = typeof SourceControlCloneRepositoryInput.Type;
 
@@ -92,6 +94,7 @@ export const SourceControlPublishRepositoryInput = Schema.Struct({
   visibility: SourceControlRepositoryVisibility,
   remoteName: Schema.optional(TrimmedNonEmptyString),
   protocol: Schema.optional(SourceControlCloneProtocol),
+  githubAccount: Schema.optional(TrimmedNonEmptyString),
 });
 export type SourceControlPublishRepositoryInput = typeof SourceControlPublishRepositoryInput.Type;
 
@@ -118,13 +121,74 @@ export const SourceControlProviderAuthStatus = Schema.Literals([
 ]);
 export type SourceControlProviderAuthStatus = typeof SourceControlProviderAuthStatus.Type;
 
+export const SourceControlProviderAuthAccount = Schema.Struct({
+  account: TrimmedNonEmptyString,
+  host: TrimmedNonEmptyString,
+  status: SourceControlProviderAuthStatus,
+  active: Schema.Boolean,
+  detail: Schema.Option(TrimmedNonEmptyString),
+});
+export type SourceControlProviderAuthAccount = typeof SourceControlProviderAuthAccount.Type;
+
 export const SourceControlProviderAuth = Schema.Struct({
   status: SourceControlProviderAuthStatus,
   account: Schema.Option(TrimmedNonEmptyString),
   host: Schema.Option(TrimmedNonEmptyString),
   detail: Schema.Option(TrimmedNonEmptyString),
+  // Optional so a newer server can still talk to clients cached on the
+  // single-account discovery shape.
+  accounts: Schema.optional(Schema.Array(SourceControlProviderAuthAccount)),
 });
 export type SourceControlProviderAuth = typeof SourceControlProviderAuth.Type;
+
+export const GitHubAccountBinding = Schema.Struct({
+  account: Schema.NullOr(TrimmedNonEmptyString),
+  source: Schema.Literals(["repository", "inherited", "none"]),
+});
+export type GitHubAccountBinding = typeof GitHubAccountBinding.Type;
+
+export const GitHubAccountBindingInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+});
+export type GitHubAccountBindingInput = typeof GitHubAccountBindingInput.Type;
+
+export const GitHubAccountBindingUpdateInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+  account: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type GitHubAccountBindingUpdateInput = typeof GitHubAccountBindingUpdateInput.Type;
+
+export const GitHubLoginStartResult = Schema.Struct({
+  loginId: TrimmedNonEmptyString,
+  verificationUri: TrimmedNonEmptyString,
+  userCode: TrimmedNonEmptyString,
+});
+export type GitHubLoginStartResult = typeof GitHubLoginStartResult.Type;
+
+export const GitHubLoginStatusInput = Schema.Struct({
+  loginId: TrimmedNonEmptyString,
+});
+export type GitHubLoginStatusInput = typeof GitHubLoginStatusInput.Type;
+
+export const GitHubLoginStatus = Schema.Union([
+  Schema.Struct({ status: Schema.Literal("pending") }),
+  Schema.Struct({
+    status: Schema.Literal("succeeded"),
+    account: TrimmedNonEmptyString,
+    alreadyAuthenticated: Schema.Boolean,
+  }),
+  Schema.Struct({
+    status: Schema.Literal("failed"),
+    detail: TrimmedNonEmptyString,
+  }),
+]);
+export type GitHubLoginStatus = typeof GitHubLoginStatus.Type;
+
+export const GitHubAccountLogoutInput = Schema.Struct({
+  account: TrimmedNonEmptyString,
+  host: TrimmedNonEmptyString,
+});
+export type GitHubAccountLogoutInput = typeof GitHubAccountLogoutInput.Type;
 
 const SourceControlDiscoverySharedFields = {
   label: TrimmedNonEmptyString,

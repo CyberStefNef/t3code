@@ -252,9 +252,15 @@ type AddProjectRemoteSource = AddProjectRemoteProviderKind | "url";
 
 type AddProjectCloneFlow =
   | {
+      readonly step: "account";
+      readonly environmentId: EnvironmentId;
+      readonly source: "github";
+    }
+  | {
       readonly step: "repository";
       readonly environmentId: EnvironmentId;
       readonly source: AddProjectRemoteSource;
+      readonly githubAccount?: string;
     }
   | {
       readonly step: "confirm";
@@ -263,6 +269,7 @@ type AddProjectCloneFlow =
       readonly repositoryInput: string;
       readonly repository: SourceControlRepositoryInfo | null;
       readonly remoteUrl: string;
+      readonly githubAccount?: string;
     };
 
 const REMOTE_PROJECT_SOURCES: ReadonlyArray<AddProjectRemoteSource> = [
@@ -344,6 +351,7 @@ function projectFaviconIcon(project: Project): ReactNode {
 function remoteProjectInputPlaceholder(flow: AddProjectCloneFlow | null): string | null {
   if (!flow) return null;
   if (flow.step === "confirm") return null;
+  if (flow.step === "account") return "Choose the GitHub account for this clone";
   if (flow.source === "url") {
     return "Enter Git clone URL";
   }
@@ -1070,11 +1078,21 @@ function OpenCommandPaletteDialog(props: {
           input: {},
         }),
   );
+  const cloneGitHubAccounts = useMemo(
+    () =>
+      (
+        sourceControlDiscovery.data?.sourceControlProviders.find(
+          (provider) => provider.kind === "github",
+        )?.auth.accounts ?? []
+      ).filter((account) => account.host === "github.com" && account.status === "authenticated"),
+    [sourceControlDiscovery.data],
+  );
   const browseEnvironmentPlatform = getEnvironmentBrowsePlatform(
     browseEnvironment?.serverConfig?.environment.platform.os,
   );
   const isRemoteProjectCloneFlow = addProjectCloneFlow !== null;
-  const isRemoteProjectRepositoryStep = addProjectCloneFlow?.step === "repository";
+  const isRemoteProjectRepositoryStep =
+    addProjectCloneFlow?.step === "repository" || addProjectCloneFlow?.step === "account";
   // The destination step pins the repository folder onto the browsed path, so
   // the proposed clone target is "<chosen folder>/<repo>" instead of the bare
   // folder. A lookup reports "owner/repo"; a pasted clone URL falls back to its
@@ -1552,14 +1570,25 @@ function OpenCommandPaletteDialog(props: {
   const startAddProjectClone = useCallback(
     (environmentId: EnvironmentId, source: AddProjectRemoteSource): void => {
       setAddProjectEnvironmentId(environmentId);
-      setAddProjectCloneFlow({ step: "repository", environmentId, source });
+      setAddProjectCloneFlow(
+        source === "github" && cloneGitHubAccounts.length > 1
+          ? { step: "account", environmentId, source }
+          : {
+              step: "repository",
+              environmentId,
+              source,
+              ...(source === "github" && cloneGitHubAccounts[0]
+                ? { githubAccount: cloneGitHubAccounts[0].account }
+                : {}),
+            },
+      );
       pushPaletteView({
         addonIcon: remoteProjectSourceIcon(source, ADDON_ICON_CLASS),
         groups: [],
         initialQuery: "",
       });
     },
-    [pushPaletteView],
+    [cloneGitHubAccounts, pushPaletteView],
   );
 
   /** Folder that holds an environment's name-only projects, or null when it has none. */
@@ -2555,6 +2584,10 @@ function OpenCommandPaletteDialog(props: {
       return;
     }
 
+    if (addProjectCloneFlow.step === "account") {
+      return;
+    }
+
     if (addProjectCloneFlow.step === "repository") {
       const rawRepository = query.trim();
       if (rawRepository.length === 0 || isRemoteProjectLookingUp) {
@@ -2574,6 +2607,9 @@ function OpenCommandPaletteDialog(props: {
           repositoryInput: rawRepository,
           repository: null,
           remoteUrl: normalizePastedCloneUrl(rawRepository),
+          ...(addProjectCloneFlow.githubAccount
+            ? { githubAccount: addProjectCloneFlow.githubAccount }
+            : {}),
         });
         setHighlightedItemValue(null);
         setQuery(destinationPath);
@@ -2588,6 +2624,9 @@ function OpenCommandPaletteDialog(props: {
         input: {
           provider,
           repository: rawRepository,
+          ...(addProjectCloneFlow.githubAccount
+            ? { githubAccount: addProjectCloneFlow.githubAccount }
+            : {}),
         },
       });
       if (lookupGeneration !== cloneLookupGeneration.current) return;
@@ -2616,6 +2655,9 @@ function OpenCommandPaletteDialog(props: {
         repositoryInput: rawRepository,
         repository,
         remoteUrl: getDefaultCloneUrl(repository),
+        ...(addProjectCloneFlow.githubAccount
+          ? { githubAccount: addProjectCloneFlow.githubAccount }
+          : {}),
       });
       setHighlightedItemValue(null);
       setQuery(destinationPath);
@@ -2658,6 +2700,7 @@ function OpenCommandPaletteDialog(props: {
       return;
     }
 
+    const cloneProvider = remoteProjectSourceProvider(addProjectCloneFlow.source);
     // Older servers only offer the blocking clone: the palette has to wait
     // for git so it can add the project afterwards.
     if (browseEnvironment?.serverConfig?.environment.capabilities.projectCloneTracking !== true) {
@@ -2667,6 +2710,10 @@ function OpenCommandPaletteDialog(props: {
         input: {
           remoteUrl: addProjectCloneFlow.remoteUrl,
           destinationPath,
+          ...(cloneProvider ? { provider: cloneProvider } : {}),
+          ...(addProjectCloneFlow.githubAccount
+            ? { githubAccount: addProjectCloneFlow.githubAccount }
+            : {}),
         },
       });
       setIsRemoteProjectCloning(false);
@@ -2700,6 +2747,10 @@ function OpenCommandPaletteDialog(props: {
         createdAt: new Date().toISOString(),
         remoteUrl: addProjectCloneFlow.remoteUrl,
         destinationPath,
+        ...(cloneProvider ? { provider: cloneProvider } : {}),
+        ...(addProjectCloneFlow.githubAccount
+          ? { githubAccount: addProjectCloneFlow.githubAccount }
+          : {}),
       },
     });
     setIsRemoteProjectCloning(false);
@@ -2806,6 +2857,35 @@ function OpenCommandPaletteDialog(props: {
       ),
     [browseGroups],
   );
+  const cloneGitHubAccountGroups = useMemo<CommandPaletteView["groups"]>(
+    () => [
+      {
+        value: "github-accounts",
+        label: "GitHub account",
+        items: cloneGitHubAccounts.map((account) => ({
+          kind: "action" as const,
+          value: `github-account:${account.account}`,
+          searchTerms: [account.account, account.host],
+          title: account.account,
+          description: `Use this account to look up and clone the repository`,
+          icon: <GitHubIcon className={ITEM_ICON_CLASS} />,
+          keepOpen: true,
+          run: async () => {
+            if (addProjectCloneFlow?.step !== "account") return;
+            setAddProjectCloneFlow({
+              step: "repository",
+              environmentId: addProjectCloneFlow.environmentId,
+              source: "github",
+              githubAccount: account.account,
+            });
+            setHighlightedItemValue(null);
+            setQuery("");
+          },
+        })),
+      },
+    ],
+    [addProjectCloneFlow, cloneGitHubAccounts],
+  );
 
   const remoteProjectContext = useMemo(() => {
     if (addProjectCloneFlow?.step !== "confirm") {
@@ -2814,7 +2894,11 @@ function OpenCommandPaletteDialog(props: {
 
     return {
       title: addProjectCloneFlow.repository?.nameWithOwner ?? addProjectCloneFlow.repositoryInput,
-      description: addProjectCloneFlow.repository?.url ?? addProjectCloneFlow.remoteUrl,
+      description: `${addProjectCloneFlow.repository?.url ?? addProjectCloneFlow.remoteUrl}${
+        addProjectCloneFlow.githubAccount
+          ? ` · GitHub account: ${addProjectCloneFlow.githubAccount}`
+          : ""
+      }`,
       icon: remoteProjectSourceIcon(addProjectCloneFlow.source, ITEM_ICON_CLASS),
     };
   }, [addProjectCloneFlow]);
@@ -2941,7 +3025,9 @@ function OpenCommandPaletteDialog(props: {
         ];
 
   let displayedGroups: CommandPaletteView["groups"] = filteredGroups;
-  if (newProjectFlow !== null) {
+  if (addProjectCloneFlow?.step === "account") {
+    displayedGroups = cloneGitHubAccountGroups;
+  } else if (newProjectFlow !== null) {
     displayedGroups = [
       ...(newProjectMachineGroup ? [newProjectMachineGroup] : []),
       ...newProjectOptionGroups,
@@ -3502,17 +3588,20 @@ function OpenCommandPaletteDialog(props: {
                   ? "Enter a Git clone URL and press Enter to continue."
                   : "Enter a repository path and press Enter to look it up.",
             }
-          : addProjectCloneFlow?.step === "confirm"
-            ? { emptyStateMessage: "Choose a destination path and press Enter to clone." }
-            : relativePathNeedsActiveProject
-              ? { emptyStateMessage: "Relative paths require an active project." }
-              : willCreateProjectPath
-                ? {
-                    emptyStateMessage: "Press Enter to create this folder and add it as a project.",
-                  }
-                : threadSearch.isPending
-                  ? { emptyStateMessage: "Searching thread messages…" }
-                  : {})}
+          : addProjectCloneFlow?.step === "account"
+            ? { emptyStateMessage: "No authenticated GitHub accounts are available." }
+            : addProjectCloneFlow?.step === "confirm"
+              ? { emptyStateMessage: "Choose a destination path and press Enter to clone." }
+              : relativePathNeedsActiveProject
+                ? { emptyStateMessage: "Relative paths require an active project." }
+                : willCreateProjectPath
+                  ? {
+                      emptyStateMessage:
+                        "Press Enter to create this folder and add it as a project.",
+                    }
+                  : threadSearch.isPending
+                    ? { emptyStateMessage: "Searching thread messages…" }
+                    : {})}
       />
     </CommandPaletteContent>
   );

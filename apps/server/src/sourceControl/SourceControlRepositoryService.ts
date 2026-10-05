@@ -7,7 +7,15 @@ import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 
 import {
+  SourceControlProviderError,
   SourceControlRepositoryError,
+  type GitHubAccountBinding,
+  type GitHubAccountBindingInput,
+  type GitHubAccountBindingUpdateInput,
+  type GitHubAccountLogoutInput,
+  type GitHubLoginStartResult,
+  type GitHubLoginStatus,
+  type GitHubLoginStatusInput,
   type SourceControlCloneRepositoryInput,
   type SourceControlCloneRepositoryResult,
   type SourceControlCloneProtocol,
@@ -26,6 +34,7 @@ import {
   type GitCloneProgressLine,
 } from "../project/gitCloneProgress.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as GitHubCli from "./GitHubCli.ts";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
 const isSourceControlRepositoryError = Schema.is(SourceControlRepositoryError);
 
@@ -54,6 +63,19 @@ export class SourceControlRepositoryService extends Context.Service<
     readonly publishRepository: (
       input: SourceControlPublishRepositoryInput,
     ) => Effect.Effect<SourceControlPublishRepositoryResult, SourceControlRepositoryError>;
+    readonly getGitHubAccount: (
+      input: GitHubAccountBindingInput,
+    ) => Effect.Effect<GitHubAccountBinding, SourceControlProviderError>;
+    readonly setGitHubAccount: (
+      input: GitHubAccountBindingUpdateInput,
+    ) => Effect.Effect<GitHubAccountBinding, SourceControlProviderError>;
+    readonly startGitHubLogin: Effect.Effect<GitHubLoginStartResult, SourceControlProviderError>;
+    readonly getGitHubLoginStatus: (
+      input: GitHubLoginStatusInput,
+    ) => Effect.Effect<GitHubLoginStatus, SourceControlProviderError>;
+    readonly logoutGitHubAccount: (
+      input: GitHubAccountLogoutInput,
+    ) => Effect.Effect<void, SourceControlProviderError>;
   }
 >()("t3/sourceControl/SourceControlRepositoryService") {}
 
@@ -160,6 +182,20 @@ export const make = Effect.gen(function* () {
   const git = yield* GitVcsDriver.GitVcsDriver;
   const path = yield* Path.Path;
   const providers = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
+  const github = yield* GitHubCli.GitHubCli;
+
+  const mapGitHubAccountError = (operation: string, cwd: string) =>
+    Effect.mapError(
+      (error: GitHubCli.GitHubCliError) =>
+        new SourceControlProviderError({
+          provider: "github",
+          operation,
+          command: error.command,
+          cwd,
+          detail: error.detail,
+          cause: error,
+        }),
+    );
 
   const ensureConcreteProvider = (input: {
     readonly operation: string;
@@ -189,6 +225,7 @@ export const make = Effect.gen(function* () {
     const urls = yield* provider.getRepositoryCloneUrls({
       cwd: input.cwd ?? config.cwd,
       repository: input.repository.trim(),
+      ...(providerKind === "github" && input.githubAccount ? { account: input.githubAccount } : {}),
     });
     return toRepositoryInfo(providerKind, urls);
   });
@@ -257,6 +294,7 @@ export const make = Effect.gen(function* () {
         provider: input.provider,
         repository: input.repository,
         cwd: preparedDestination.parentPath,
+        ...(input.githubAccount ? { githubAccount: input.githubAccount } : {}),
       });
       remoteUrl = selectRemoteUrl(repository, input.protocol);
       provider = input.provider;
@@ -329,6 +367,25 @@ export const make = Effect.gen(function* () {
         ),
       );
 
+    if (input.provider === "github" && input.githubAccount) {
+      yield* github
+        .setAccountBinding({
+          cwd: prepared.destinationPath,
+          account: input.githubAccount,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new SourceControlRepositoryError({
+                operation: "cloneRepository",
+                provider: "github",
+                detail: cause.detail,
+                cause,
+              }),
+          ),
+        );
+    }
+
     return {
       cwd: prepared.destinationPath,
       remoteUrl: prepared.remoteUrl,
@@ -392,10 +449,26 @@ export const make = Effect.gen(function* () {
         provider: input.provider,
       });
       const provider = yield* providers.get(providerKind);
+      if (providerKind === "github" && input.githubAccount) {
+        yield* github.setAccountBinding({ cwd: input.cwd, account: input.githubAccount }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new SourceControlRepositoryError({
+                operation: "publishRepository",
+                provider: "github",
+                detail: cause.detail,
+                cause,
+              }),
+          ),
+        );
+      }
       const urls = yield* provider.createRepository({
         cwd: input.cwd,
         repository: input.repository.trim(),
         visibility: input.visibility,
+        ...(providerKind === "github" && input.githubAccount
+          ? { account: input.githubAccount }
+          : {}),
       });
       const remoteUrl = selectRemoteUrl(urls, input.protocol);
       const remoteName = yield* git.ensureRemote({
@@ -455,6 +528,18 @@ export const make = Effect.gen(function* () {
       discardClone(destinationPath).pipe(mapRepositoryError("discardClone", "unknown")),
     publishRepository: (input) =>
       publishRepository(input).pipe(mapRepositoryError("publishRepository", input.provider)),
+    getGitHubAccount: (input) =>
+      github.getAccountBinding(input).pipe(mapGitHubAccountError("getAccountBinding", input.cwd)),
+    setGitHubAccount: (input) =>
+      github.setAccountBinding(input).pipe(mapGitHubAccountError("setAccountBinding", input.cwd)),
+    startGitHubLogin: github
+      .beginLogin({ cwd: config.cwd })
+      .pipe(mapGitHubAccountError("beginLogin", config.cwd)),
+    getGitHubLoginStatus: (input) => github.getLoginStatus(input),
+    logoutGitHubAccount: (input) =>
+      github
+        .logoutAccount({ ...input, cwd: config.cwd })
+        .pipe(mapGitHubAccountError("logoutAccount", config.cwd)),
   });
 });
 

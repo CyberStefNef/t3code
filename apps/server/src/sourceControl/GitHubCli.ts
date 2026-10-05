@@ -1,9 +1,11 @@
+import * as NodeCrypto from "node:crypto";
 import * as Cache from "effect/Cache";
 import * as Clock from "effect/Clock";
-import * as Duration from "effect/Duration";
 import * as Exit from "effect/Exit";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -13,9 +15,16 @@ import * as Request from "effect/Request";
 import * as RequestResolver from "effect/RequestResolver";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import {
   TrimmedNonEmptyString,
+  type GitHubAccountBinding,
+  type GitHubLoginStartResult,
+  type GitHubLoginStatus,
+  type GitHubLoginStatusInput,
   type SourceControlRepositoryVisibility,
   type VcsError,
 } from "@t3tools/contracts";
@@ -23,6 +32,7 @@ import { normalizeGitRemoteUrl } from "@t3tools/shared/git";
 import { decodeJsonResult } from "@t3tools/shared/schemaJson";
 
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import { parseGitHubAuthStatus } from "./gitHubAuthStatus.ts";
 import * as GitHubGraphQlBudget from "./githubGraphQlBudget.ts";
 import * as SourceControlRateLimit from "./SourceControlRateLimit.ts";
 import {
@@ -33,6 +43,11 @@ import {
 } from "./gitHubPullRequests.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+
+const SelectedAccountEnv = Context.Reference<NodeJS.ProcessEnv | null | undefined>(
+  "t3/sourceControl/SelectedAccountEnv",
+  { defaultValue: () => null },
+);
 
 /** Server-local credential scope; never put its value in RPC payloads or cache keys. */
 export const PinnedGitHubCredential = Context.Reference<{
@@ -82,6 +97,7 @@ const gitHubCliFailureFields = {
   command: Schema.Literal("gh"),
   cwd: Schema.String,
   cause: Schema.Defect(),
+  account: Schema.optional(TrimmedNonEmptyString),
 } as const;
 
 export class GitHubCliUnavailableError extends Schema.TaggedError<GitHubCliUnavailableError>()(
@@ -99,10 +115,18 @@ export class GitHubCliUnavailableError extends Schema.TaggedError<GitHubCliUnava
 
 export class GitHubCliAuthenticationError extends Schema.TaggedError<GitHubCliAuthenticationError>()(
   "GitHubCliAuthenticationError",
-  gitHubCliFailureFields,
+  {
+    ...gitHubCliFailureFields,
+    reason: Schema.optional(TrimmedNonEmptyString),
+  },
 ) {
   get detail(): string {
-    return "GitHub CLI is not authenticated. Run `gh auth login` and retry.";
+    return (
+      this.reason ??
+      (this.account
+        ? `GitHub account ${this.account} is selected for this project but is not authenticated. Add that account with \`gh auth login\` and retry.`
+        : "GitHub CLI is not authenticated. Run `gh auth login` and retry.")
+    );
   }
 
   override get message(): string {
@@ -148,6 +172,23 @@ export class GitHubCliCommandError extends Schema.TaggedError<GitHubCliCommandEr
     return `GitHub CLI failed in execute: ${this.detail}`;
   }
 }
+
+export class GitHubCliLoginError extends Schema.TaggedError<GitHubCliLoginError>()(
+  "GitHubCliLoginError",
+  {
+    ...gitHubCliFailureFields,
+    reason: TrimmedNonEmptyString,
+  },
+) {
+  get detail(): string {
+    return this.reason;
+  }
+
+  override get message(): string {
+    return `GitHub CLI failed in beginLogin: ${this.detail}`;
+  }
+}
+const isGitHubCliLoginError = Schema.is(GitHubCliLoginError);
 
 const gitHubCliDecodeFields = {
   command: Schema.Literal("gh"),
@@ -213,6 +254,7 @@ export const GitHubCliError = Schema.Union([
   GitHubCliRateLimitError,
   GitHubPullRequestNotFoundError,
   GitHubCliCommandError,
+  GitHubCliLoginError,
   GitHubPullRequestListDecodeError,
   GitHubChangeRequestListDecodeError,
   GitHubPullRequestDecodeError,
@@ -226,6 +268,7 @@ export function fromVcsError(
   context: {
     readonly command: "gh";
     readonly cwd: string;
+    readonly account?: string;
   },
   error: VcsError,
 ): GitHubCliError {
@@ -295,10 +338,32 @@ export class GitHubCli extends Context.Service<
       readonly stdin?: string;
       readonly env?: NodeJS.ProcessEnv;
       readonly maxOutputBytes?: number;
+      readonly account?: string;
       readonly rateLimitHost?: string;
       readonly allowReserve?: boolean;
       readonly acceptNotModified?: boolean;
     }) => Effect.Effect<VcsProcess.VcsProcessOutput, GitHubCliError>;
+
+    readonly getAccountBinding: (input: {
+      readonly cwd: string;
+    }) => Effect.Effect<GitHubAccountBinding, GitHubCliError>;
+
+    readonly setAccountBinding: (input: {
+      readonly cwd: string;
+      readonly account: string | null;
+    }) => Effect.Effect<GitHubAccountBinding, GitHubCliError>;
+
+    readonly beginLogin: (input: {
+      readonly cwd: string;
+    }) => Effect.Effect<GitHubLoginStartResult, GitHubCliError>;
+
+    readonly getLoginStatus: (input: GitHubLoginStatusInput) => Effect.Effect<GitHubLoginStatus>;
+
+    readonly logoutAccount: (input: {
+      readonly cwd: string;
+      readonly account: string;
+      readonly host: string;
+    }) => Effect.Effect<void, GitHubCliError>;
 
     readonly listOpenPullRequests: (input: {
       readonly cwd: string;
@@ -330,12 +395,14 @@ export class GitHubCli extends Context.Service<
     readonly getRepositoryCloneUrls: (input: {
       readonly cwd: string;
       readonly repository: string;
+      readonly account?: string;
     }) => Effect.Effect<GitHubRepositoryCloneUrls, GitHubCliError>;
 
     readonly createRepository: (input: {
       readonly cwd: string;
       readonly repository: string;
       readonly visibility: SourceControlRepositoryVisibility;
+      readonly account?: string;
     }) => Effect.Effect<GitHubRepositoryCloneUrls, GitHubCliError>;
 
     readonly createPullRequest: (input: {
@@ -376,6 +443,10 @@ function normalizeRepositoryCloneUrls(
     url: raw.url,
     sshUrl: raw.sshUrl,
   };
+}
+
+export function extractGitHubDeviceCode(text: string): string | null {
+  return text.match(/\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/u)?.[1] ?? null;
 }
 
 /**
@@ -560,9 +631,487 @@ export function selectGitHubBaseRepository(input: {
 
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
-  const process = yield* VcsProcess.VcsProcess;
+  const vcsProcess = yield* VcsProcess.VcsProcess;
+  const spawner = yield* Effect.serviceOption(ChildProcessSpawner.ChildProcessSpawner);
+  const serviceScope = yield* Effect.scope;
+  let activeLogin: {
+    readonly loginId: string;
+    readonly child: ChildProcessSpawner.ChildProcessHandle;
+    readonly authenticatedAccountsBefore: ReadonlySet<string>;
+    userCode: string | null;
+  } | null = null;
+  let nextLoginId = 0;
+  const loginStatuses = new Map<string, GitHubLoginStatus>();
+  const setLoginStatus = (loginId: string, status: GitHubLoginStatus) => {
+    loginStatuses.delete(loginId);
+    loginStatuses.set(loginId, status);
+    if (loginStatuses.size <= 20) return;
+    const oldestLoginId = loginStatuses.keys().next().value;
+    if (oldestLoginId !== undefined) loginStatuses.delete(oldestLoginId);
+  };
+  const getLoginStatus: GitHubCli["Service"]["getLoginStatus"] = (input) =>
+    Effect.sync(
+      () =>
+        loginStatuses.get(input.loginId) ?? {
+          status: "failed",
+          detail: "This GitHub sign-in session is no longer available. Start again.",
+        },
+    );
+
+  const readAccount = Effect.fn("GitHubCli.readAccount")(function* (input: {
+    readonly cwd: string;
+    readonly local: boolean;
+  }) {
+    const result = yield* vcsProcess
+      .run({
+        operation: "GitHubCli.readAccount",
+        command: "git",
+        args: ["config", ...(input.local ? ["--local"] : []), "--get", "github.account"],
+        cwd: input.cwd,
+        allowNonZeroExit: true,
+        timeoutMs: 5_000,
+        maxOutputBytes: 4_000,
+      })
+      .pipe(
+        Effect.mapError(
+          (error) => new GitHubCliCommandError({ command: "gh", cwd: input.cwd, cause: error }),
+        ),
+      );
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      return yield* new GitHubCliCommandError({
+        command: "gh",
+        cwd: input.cwd,
+        cause: new Error(`Git could not read github.account (exit ${result.exitCode}).`),
+      });
+    }
+    const account = result.stdout.trim();
+    return account.length > 0 ? account : null;
+  });
+
+  const getAccountBinding: GitHubCli["Service"]["getAccountBinding"] = Effect.fn(
+    "GitHubCli.getAccountBinding",
+  )(function* (input) {
+    const localAccount = yield* readAccount({ cwd: input.cwd, local: true });
+    if (localAccount !== null) {
+      return { account: localAccount, source: "repository" };
+    }
+    const inheritedAccount = yield* readAccount({ cwd: input.cwd, local: false });
+    return inheritedAccount === null
+      ? { account: null, source: "none" }
+      : { account: inheritedAccount, source: "inherited" };
+  });
+
+  const resolveTokenForAccount = Effect.fn("GitHubCli.resolveTokenForAccount")(function* (
+    cwd: string,
+    account: string,
+  ) {
+    const tokenResult = yield* vcsProcess
+      .run({
+        operation: "GitHubCli.resolveAccountToken",
+        command: "gh",
+        args: ["auth", "token", "--hostname", "github.com", "--user", account],
+        cwd,
+        env: { GH_TOKEN: "", GITHUB_TOKEN: "" },
+        timeoutMs: 5_000,
+        maxOutputBytes: 4_000,
+      })
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new GitHubCliAuthenticationError({ command: "gh", cwd, account, cause: error }),
+        ),
+      );
+    const token = tokenResult.stdout.trim();
+    if (token.length === 0) {
+      return yield* new GitHubCliAuthenticationError({
+        command: "gh",
+        cwd,
+        account,
+        cause: new Error("GitHub CLI returned an empty token for the selected account."),
+      });
+    }
+    return { GH_TOKEN: token };
+  });
+
+  const resolveAccountEnv = Effect.fn("GitHubCli.resolveAccountEnv")(function* (cwd: string) {
+    const configuredAccount = yield* readAccount({ cwd, local: false });
+    if (configuredAccount !== null) {
+      return yield* resolveTokenForAccount(cwd, configuredAccount);
+    }
+
+    const statusResult = yield* vcsProcess
+      .run({
+        operation: "GitHubCli.resolveAvailableAccounts",
+        command: "gh",
+        args: ["auth", "status", "--json", "hosts"],
+        cwd,
+        env: { GH_TOKEN: "", GITHUB_TOKEN: "" },
+        allowNonZeroExit: true,
+        timeoutMs: 5_000,
+        maxOutputBytes: 16_000,
+      })
+      .pipe(
+        Effect.mapError(
+          (error) => new GitHubCliAuthenticationError({ command: "gh", cwd, cause: error }),
+        ),
+      );
+    const accounts = parseGitHubAuthStatus(statusResult.stdout).accounts.filter(
+      (account) => account.host === "github.com" && account.authenticated,
+    );
+    if (accounts.length > 1) {
+      return yield* new GitHubCliAuthenticationError({
+        command: "gh",
+        cwd,
+        reason:
+          "Multiple GitHub accounts are signed in. Choose an account for this project before continuing.",
+        cause: new Error("GitHub account selection is required."),
+      });
+    }
+    const onlyAccount = accounts[0]?.account;
+    return onlyAccount ? yield* resolveTokenForAccount(cwd, onlyAccount) : undefined;
+  });
+  const accountEnvCache = yield* Cache.make({
+    capacity: 512,
+    timeToLive: Duration.seconds(2),
+    lookup: resolveAccountEnv,
+  });
+
+  const setAccountBinding: GitHubCli["Service"]["setAccountBinding"] = Effect.fn(
+    "GitHubCli.setAccountBinding",
+  )(function* (input) {
+    const result = yield* vcsProcess
+      .run({
+        operation: "GitHubCli.setAccountBinding",
+        command: "git",
+        args:
+          input.account === null
+            ? ["config", "--local", "--unset-all", "github.account"]
+            : ["config", "--local", "--replace-all", "github.account", input.account],
+        cwd: input.cwd,
+        allowNonZeroExit: input.account === null,
+        timeoutMs: 5_000,
+        maxOutputBytes: 4_000,
+      })
+      .pipe(
+        Effect.mapError(
+          (error) => new GitHubCliCommandError({ command: "gh", cwd: input.cwd, cause: error }),
+        ),
+      );
+    if (input.account === null && result.exitCode !== 0 && result.exitCode !== 5) {
+      return yield* new GitHubCliCommandError({
+        command: "gh",
+        cwd: input.cwd,
+        cause: new Error(`Git could not clear github.account (exit ${result.exitCode}).`),
+      });
+    }
+    yield* Cache.invalidate(accountEnvCache, input.cwd);
+    return yield* getAccountBinding({ cwd: input.cwd });
+  });
+
+  const readAuthenticatedAccounts = Effect.fn("GitHubCli.readAuthenticatedAccounts")(function* (
+    cwd: string,
+  ) {
+    const result = yield* vcsProcess
+      .run({
+        operation: "GitHubCli.readAuthenticatedAccounts",
+        command: "gh",
+        args: ["auth", "status", "--json", "hosts"],
+        cwd,
+        env: { GH_TOKEN: "", GITHUB_TOKEN: "" },
+        allowNonZeroExit: true,
+        timeoutMs: 5_000,
+        maxOutputBytes: 16_000,
+      })
+      .pipe(
+        Effect.mapError(
+          (cause) =>
+            new GitHubCliLoginError({
+              command: "gh",
+              cwd,
+              reason: "GitHub CLI could not inspect the signed-in accounts.",
+              cause,
+            }),
+        ),
+      );
+    return new Set(
+      parseGitHubAuthStatus(result.stdout)
+        .accounts.filter((account) => account.host === "github.com" && account.authenticated)
+        .map((account) => account.account),
+    );
+  });
+
+  const resolveCompletedLoginAccount = Effect.fn("GitHubCli.resolveCompletedLoginAccount")(
+    function* (session: NonNullable<typeof activeLogin>, cwd: string) {
+      const authenticatedAccountsAfter = yield* readAuthenticatedAccounts(cwd);
+      const addedAccount = [...authenticatedAccountsAfter].find(
+        (account) => !session.authenticatedAccountsBefore.has(account),
+      );
+      if (addedAccount) return { account: addedAccount, alreadyAuthenticated: false };
+
+      const result = yield* vcsProcess
+        .run({
+          operation: "GitHubCli.resolveCompletedLoginAccount",
+          command: "gh",
+          args: ["api", "user", "--jq", ".login"],
+          cwd,
+          env: { GH_TOKEN: "", GITHUB_TOKEN: "" },
+          timeoutMs: 5_000,
+          maxOutputBytes: 4_000,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new GitHubCliLoginError({
+                command: "gh",
+                cwd,
+                reason: "GitHub sign-in completed, but the account could not be identified.",
+                cause,
+              }),
+          ),
+        );
+      const account = result.stdout.trim();
+      if (!account) {
+        return yield* new GitHubCliLoginError({
+          command: "gh",
+          cwd,
+          reason: "GitHub sign-in completed, but the account could not be identified.",
+          cause: new Error("GitHub CLI returned an empty account name."),
+        });
+      }
+      return {
+        account,
+        alreadyAuthenticated: session.authenticatedAccountsBefore.has(account),
+      };
+    },
+  );
+
+  const beginLogin: GitHubCli["Service"]["beginLogin"] = Effect.fn("GitHubCli.beginLogin")(
+    function* (input) {
+      if (activeLogin?.userCode) {
+        return {
+          loginId: activeLogin.loginId,
+          verificationUri: "https://github.com/login/device",
+          userCode: activeLogin.userCode,
+        };
+      }
+      if (activeLogin) {
+        return yield* new GitHubCliLoginError({
+          command: "gh",
+          cwd: input.cwd,
+          reason: "A GitHub sign-in is already starting. Try again in a moment.",
+          cause: new Error("GitHub login process is already running."),
+        });
+      }
+
+      if (Option.isNone(spawner)) {
+        return yield* new GitHubCliLoginError({
+          command: "gh",
+          cwd: input.cwd,
+          reason: "GitHub sign-in is unavailable in this environment.",
+          cause: new Error("Child process spawning is unavailable."),
+        });
+      }
+      const authenticatedAccountsBefore = yield* readAuthenticatedAccounts(input.cwd);
+
+      const child = yield* spawner.value
+        .spawn(
+          ChildProcess.make(
+            "gh",
+            [
+              "auth",
+              "login",
+              "--hostname",
+              "github.com",
+              "--git-protocol",
+              "ssh",
+              "--skip-ssh-key",
+              "--web",
+            ],
+            {
+              cwd: input.cwd,
+              env: { GH_TOKEN: "", GITHUB_TOKEN: "" },
+              stdin: { stream: Stream.empty, endOnDone: true },
+            },
+          ),
+        )
+        .pipe(
+          Effect.provideService(Scope.Scope, serviceScope),
+          Effect.mapError(
+            (cause) =>
+              new GitHubCliLoginError({
+                command: "gh",
+                cwd: input.cwd,
+                reason: "GitHub CLI could not start the browser sign-in flow.",
+                cause,
+              }),
+          ),
+        );
+      const session: {
+        readonly loginId: string;
+        readonly child: ChildProcessSpawner.ChildProcessHandle;
+        readonly authenticatedAccountsBefore: ReadonlySet<string>;
+        userCode: string | null;
+      } = {
+        loginId: `github-login-${++nextLoginId}`,
+        child,
+        authenticatedAccountsBefore,
+        userCode: null,
+      };
+      activeLogin = session;
+      setLoginStatus(session.loginId, { status: "pending" });
+      const deviceCode = yield* Deferred.make<GitHubLoginStartResult, GitHubCliError>();
+      let output = "";
+
+      const observeLogin = child.all.pipe(
+        Stream.decodeText(),
+        Stream.runForEach((chunk) =>
+          Effect.gen(function* () {
+            output = `${output}${chunk}`.slice(-8_000);
+            const userCode = extractGitHubDeviceCode(output);
+            if (session.userCode !== null || userCode === null) return;
+            session.userCode = userCode;
+            yield* Deferred.succeed(deviceCode, {
+              loginId: session.loginId,
+              verificationUri: "https://github.com/login/device",
+              userCode,
+            });
+          }),
+        ),
+        Effect.andThen(child.exitCode),
+        Effect.flatMap((exitCode) => {
+          if (session.userCode === null) {
+            const error = new GitHubCliLoginError({
+              command: "gh",
+              cwd: input.cwd,
+              reason: "GitHub CLI ended before producing a device code.",
+              cause: new Error(`GitHub login exited with code ${exitCode}.`),
+            });
+            setLoginStatus(session.loginId, { status: "failed", detail: error.detail });
+            return Deferred.fail(deviceCode, error);
+          }
+          if (exitCode !== 0) {
+            setLoginStatus(session.loginId, {
+              status: "failed",
+              detail: "GitHub sign-in did not complete. Try again.",
+            });
+            return Effect.void;
+          }
+          return resolveCompletedLoginAccount(session, input.cwd).pipe(
+            Effect.tap((result) =>
+              Effect.sync(() => {
+                setLoginStatus(session.loginId, { status: "succeeded", ...result });
+              }),
+            ),
+            Effect.andThen(Cache.invalidateAll(accountEnvCache)),
+          );
+        }),
+        Effect.catch((cause) =>
+          Effect.gen(function* () {
+            const error = isGitHubCliLoginError(cause)
+              ? cause
+              : new GitHubCliLoginError({
+                  command: "gh",
+                  cwd: input.cwd,
+                  reason: "GitHub CLI sign-in output could not be read.",
+                  cause,
+                });
+            setLoginStatus(session.loginId, { status: "failed", detail: error.detail });
+            yield* Deferred.fail(deviceCode, error);
+          }),
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (activeLogin === session) activeLogin = null;
+          }),
+        ),
+      );
+      yield* observeLogin.pipe(Effect.forkIn(serviceScope));
+
+      return yield* Deferred.await(deviceCode).pipe(
+        Effect.timeoutOrElse({
+          duration: "15 seconds",
+          orElse: () =>
+            child.kill().pipe(
+              Effect.ignore,
+              Effect.andThen(
+                Effect.sync(() => {
+                  if (activeLogin === session) activeLogin = null;
+                  setLoginStatus(session.loginId, {
+                    status: "failed",
+                    detail: "GitHub CLI did not produce a device code in time.",
+                  });
+                }),
+              ),
+              Effect.andThen(
+                Effect.fail(
+                  new GitHubCliLoginError({
+                    command: "gh",
+                    cwd: input.cwd,
+                    reason: "GitHub CLI did not produce a device code in time.",
+                    cause: new Error("Timed out waiting for GitHub device code."),
+                  }),
+                ),
+              ),
+            ),
+        }),
+      );
+    },
+  );
+
+  const logoutAccount: GitHubCli["Service"]["logoutAccount"] = Effect.fn("GitHubCli.logoutAccount")(
+    function* (input) {
+      yield* vcsProcess
+        .run({
+          operation: "GitHubCli.logoutAccount",
+          command: "gh",
+          args: ["auth", "logout", "--hostname", input.host, "--user", input.account],
+          cwd: input.cwd,
+          env: { GH_TOKEN: "", GITHUB_TOKEN: "" },
+          timeoutMs: 15_000,
+          maxOutputBytes: 4_000,
+        })
+        .pipe(
+          Effect.mapError((error) =>
+            fromVcsError(
+              {
+                command: "gh",
+                cwd: input.cwd,
+                ...(input.account ? { account: input.account } : {}),
+              },
+              error,
+            ),
+          ),
+        );
+      yield* Cache.invalidateAll(accountEnvCache);
+    },
+  );
+
   const budget = yield* GitHubGraphQlBudget.GitHubGraphQlBudget;
   const limits = yield* SourceControlRateLimit.SourceControlRateLimit;
+
+  const resolveCommandEnv = Effect.fn("GitHubCli.resolveCommandEnv")(function* (
+    input: Parameters<GitHubCli["Service"]["execute"]>[0],
+  ) {
+    const selectedEnv = yield* SelectedAccountEnv;
+    if (selectedEnv !== null) return selectedEnv;
+    const credential = yield* PinnedGitHubCredential;
+    const host =
+      commandHosts(input.args).find((host) => host !== null) ??
+      input.rateLimitHost ??
+      input.env?.GH_HOST ??
+      "github.com";
+    if (
+      credential !== null ||
+      host !== "github.com" ||
+      input.env?.GH_TOKEN ||
+      input.env?.GITHUB_TOKEN
+    )
+      return input.env;
+    const accountEnv = input.account
+      ? yield* resolveTokenForAccount(input.cwd, input.account)
+      : yield* Cache.get(accountEnvCache, input.cwd);
+    return accountEnv === undefined ? input.env : { ...accountEnv, ...input.env };
+  });
 
   const executeRaw: GitHubCli["Service"]["execute"] = Effect.fn("GitHubCli.executeRaw")(
     function* (input) {
@@ -577,7 +1126,7 @@ export const make = Effect.gen(function* () {
       const token = credential === null ? undefined : Redacted.value(credential.token);
       const env =
         credential === null
-          ? input.env
+          ? yield* resolveCommandEnv(input)
           : {
               ...input.env,
               GH_HOST: credential.host,
@@ -587,7 +1136,16 @@ export const make = Effect.gen(function* () {
               GITHUB_ENTERPRISE_TOKEN: token,
               GH_DEBUG: "",
             };
-      const result = yield* process
+      if (input.args[0] === "auth" && input.args[1] === "token" && env?.GH_TOKEN) {
+        return {
+          exitCode: ChildProcessSpawner.ExitCode(0),
+          stdout: env.GH_TOKEN,
+          stderr: "",
+          stdoutTruncated: false,
+          stderrTruncated: false,
+        };
+      }
+      const result = yield* vcsProcess
         .run({
           operation: "GitHubCli.execute",
           command: "gh",
@@ -674,7 +1232,6 @@ export const make = Effect.gen(function* () {
       timeToLive: (exit) => (Exit.isSuccess(exit) ? exit.value : Duration.minutes(1)),
     },
   );
-
   /**
    * Runs a GraphQL-priced read under its host's pause and the GraphQL budget. `run` receives
    * the document with `rateLimit` added, so a GraphQL read can report what it spent; a CLI read
@@ -689,6 +1246,13 @@ export const make = Effect.gen(function* () {
   }) =>
     Effect.gen(function* () {
       const credential = yield* PinnedGitHubCredential;
+      const selectedEnv = yield* SelectedAccountEnv;
+      const selectedToken = selectedEnv?.GH_TOKEN ?? selectedEnv?.GITHUB_TOKEN;
+      const fingerprint =
+        credential?.credentialFingerprint ??
+        (selectedToken
+          ? `${input.host}:${NodeCrypto.createHash("sha256").update(selectedToken).digest("hex")}`
+          : "");
       const key = { provider: "github" as const, host: input.host };
       const guarded = Effect.gen(function* () {
         const lease = yield* limits.check(
@@ -719,7 +1283,7 @@ export const make = Effect.gen(function* () {
       return yield* guarded.pipe(
         Effect.provideService(
           SourceControlRateLimit.CredentialScope,
-          credential?.credentialFingerprint ?? (yield* SourceControlRateLimit.CredentialScope),
+          fingerprint || (yield* SourceControlRateLimit.CredentialScope),
         ),
         Effect.catchTags({
           SourceControlRateLimitPausedError: (cause) =>
@@ -735,7 +1299,7 @@ export const make = Effect.gen(function* () {
       );
     });
 
-  const execute: GitHubCli["Service"]["execute"] = Effect.fn("GitHubCli.execute")(
+  const executeWithEnv: GitHubCli["Service"]["execute"] = Effect.fn("GitHubCli.execute")(
     function* (input) {
       const [command, action] = input.args;
       if (
@@ -764,6 +1328,13 @@ export const make = Effect.gen(function* () {
       });
     },
   );
+
+  const execute: GitHubCli["Service"]["execute"] = (input) =>
+    resolveCommandEnv(input).pipe(
+      Effect.flatMap((env) =>
+        executeWithEnv(input).pipe(Effect.provideService(SelectedAccountEnv, env)),
+      ),
+    );
 
   const listPullRequestsWithCli = (input: {
     readonly cwd: string;
@@ -805,7 +1376,7 @@ export const make = Effect.gen(function* () {
     );
 
   const git = (cwd: string, args: ReadonlyArray<string>) =>
-    process.run({
+    vcsProcess.run({
       operation: "GitHubCli.baseRepository",
       command: "git",
       args,
@@ -945,6 +1516,11 @@ export const make = Effect.gen(function* () {
   return GitHubCli.of({
     execute,
     listPullRequestsByHead,
+    getAccountBinding,
+    setAccountBinding,
+    beginLogin,
+    getLoginStatus,
+    logoutAccount,
     listOpenPullRequests: (input) =>
       execute({
         cwd: input.cwd,
@@ -1019,6 +1595,7 @@ export const make = Effect.gen(function* () {
     getRepositoryCloneUrls: (input) =>
       execute({
         cwd: input.cwd,
+        ...(input.account ? { account: input.account } : {}),
         args: ["repo", "view", input.repository, "--json", "nameWithOwner,url,sshUrl"],
       }).pipe(
         Effect.map((result) => result.stdout.trim()),
@@ -1039,6 +1616,7 @@ export const make = Effect.gen(function* () {
     createRepository: (input) =>
       execute({
         cwd: input.cwd,
+        ...(input.account ? { account: input.account } : {}),
         args: ["repo", "create", input.repository, `--${input.visibility}`],
       }).pipe(
         Effect.map((result) =>

@@ -1,12 +1,15 @@
 import { assert, it, afterEach, describe, expect, vi } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as PlatformError from "effect/PlatformError";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
 import * as Cache from "effect/Cache";
 import * as TestClock from "effect/testing/TestClock";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
-import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
-import * as Layer from "effect/Layer";
-import * as PlatformError from "effect/PlatformError";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -19,14 +22,49 @@ import * as SourceControlRateLimit from "./SourceControlRateLimit.ts";
 
 const encodeGitHubCliError = Schema.encodeEffect(Schema.fromJsonString(GitHubCli.GitHubCliError));
 
-const processOutput = (stdout: string): VcsProcess.VcsProcessOutput => ({
-  exitCode: ChildProcessSpawner.ExitCode(0),
+const processOutput = (stdout: string, exitCode = 0): VcsProcess.VcsProcessOutput => ({
+  exitCode: ChildProcessSpawner.ExitCode(exitCode),
   stdout,
   stderr: "",
   stdoutTruncated: false,
   stderrTruncated: false,
 });
 
+const githubAuthStatus = (accounts: ReadonlyArray<string>) =>
+  JSON.stringify({
+    hosts: {
+      "github.com": accounts.map((login, index) => ({
+        state: "success",
+        active: index === accounts.length - 1,
+        host: "github.com",
+        login,
+      })),
+    },
+  });
+
+const completedLoginHandle = () =>
+  ChildProcessSpawner.makeHandle({
+    pid: ChildProcessSpawner.ProcessId(43),
+    exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+    isRunning: Effect.succeed(false),
+    kill: () => Effect.void,
+    unref: Effect.succeed(Effect.void),
+    stdin: Sink.drain,
+    stdout: Stream.empty,
+    stderr: Stream.empty,
+    all: Stream.encodeText(Stream.make("! First copy your one-time code: WXYZ-1234\n")),
+    getInputFd: () => Sink.drain,
+    getOutputFd: () => Stream.empty,
+  });
+
+const mockGhRun = vi.fn<VcsProcess.VcsProcess["Service"]["run"]>();
+const mockRun = vi.fn<VcsProcess.VcsProcess["Service"]["run"]>((input) =>
+  input.command === "git" && input.args.includes("github.account")
+    ? Effect.succeed(processOutput(""))
+    : input.command === "gh" && input.args[0] === "auth" && input.args[1] === "status"
+      ? Effect.succeed(processOutput('{"hosts":{}}'))
+      : mockGhRun(input),
+);
 const quotaOutput = (remaining = 5000, resetAt = "2099-01-01T00:00:00Z") =>
   processOutput(
     JSON.stringify({ data: { rateLimit: { cost: 1, limit: 5000, remaining, resetAt } } }),
@@ -37,8 +75,6 @@ const isBudgetReading = (input: VcsProcess.VcsProcessInput) =>
   input.args[1] === "graphql" &&
   input.args.at(-1)?.includes("rateLimit");
 
-const mockRun = vi.fn<VcsProcess.VcsProcess["Service"]["run"]>();
-
 // Budget readings are answered here, so `mockRun` sees only the commands under test.
 const layer = GitHubCli.layer.pipe(
   Layer.provide(
@@ -46,10 +82,36 @@ const layer = GitHubCli.layer.pipe(
       run: (input) => (isBudgetReading(input) ? Effect.succeed(quotaOutput()) : mockRun(input)),
     }),
   ),
+  Layer.provide(NodeServices.layer),
+);
+
+const batchLayer = GitHubCli.layer.pipe(
+  Layer.provide(
+    Layer.mock(VcsProcess.VcsProcess)({
+      run: (input) => {
+        if (input.command === "git" && input.args.includes("github.account")) {
+          return Effect.succeed(processOutput(""));
+        }
+        if (input.command === "gh" && input.args[0] === "auth" && input.args[1] === "status") {
+          return Effect.succeed(processOutput('{"hosts":{}}'));
+        }
+        return isBudgetReading(input) ? Effect.succeed(quotaOutput()) : mockRun(input);
+      },
+    }),
+  ),
+  Layer.provide(NodeServices.layer),
 );
 
 afterEach(() => {
   mockRun.mockReset();
+  mockRun.mockImplementation((input) =>
+    input.command === "git" && input.args.includes("github.account")
+      ? Effect.succeed(processOutput(""))
+      : input.command === "gh" && input.args[0] === "auth" && input.args[1] === "status"
+        ? Effect.succeed(processOutput('{"hosts":{}}'))
+        : mockGhRun(input),
+  );
+  mockGhRun.mockReset();
 });
 
 it.effect("reads the GraphQL budget once per window, preserves the reserve, and resumes", () =>
@@ -69,6 +131,9 @@ it.effect("reads the GraphQL budget once per window, preserves the reserve, and 
               assert.strictEqual(input.args[3], "enterprise.test");
               return quotaOutput(remaining, resetAt);
             }
+            if (input.command === "git") return processOutput("");
+            if (input.args[0] === "auth" && input.args[1] === "status")
+              return processOutput('{"hosts":{}}');
             commands.push(input.args.slice(0, 2).join(" "));
             return processOutput("[]");
           }),
@@ -297,7 +362,7 @@ describe("GitHubCli.listPullRequestsByHead", () => {
         h1: "feature/b",
         s1: ["OPEN", "CLOSED", "MERGED"],
       });
-    }).pipe(Effect.provide(layer)),
+    }).pipe(Effect.provide(batchLayer)),
   );
 
   it.effect("asks gh pr list when gh could read another repository", () =>
@@ -351,7 +416,7 @@ describe("GitHubCli.listPullRequestsByHead", () => {
         rateLimitHost: "github.com",
       });
       assert.deepStrictEqual(empty, []);
-    }).pipe(Effect.provide(layer)),
+    }).pipe(Effect.provide(batchLayer)),
   );
 
   it.effect("fails a rate-limited document whole instead of asking head by head", () =>
@@ -395,7 +460,7 @@ describe("GitHubCli.listPullRequestsByHead", () => {
         ["GitHubCliRateLimitError", "GitHubCliRateLimitError"],
       );
       assert.strictEqual(ghCalls, 1);
-    }).pipe(Effect.provide(layer)),
+    }).pipe(Effect.provide(batchLayer)),
   );
 });
 
@@ -407,7 +472,7 @@ describe("GitHubCli.layer", () => {
       yield* budget.observe("github.com", quotaOutput(0).stdout);
       const error = yield* gh.execute({ cwd: "/repo", args: ["pr", "list"] }).pipe(Effect.flip);
       assert.strictEqual(error._tag, "GitHubCliRateLimitError");
-      expect(mockRun).not.toHaveBeenCalled();
+      expect(mockGhRun).not.toHaveBeenCalled();
     }).pipe(Effect.provide(layer.pipe(Layer.provide(GitHubGraphQlBudget.layer)))),
   );
 
@@ -444,7 +509,15 @@ describe("GitHubCli.layer", () => {
   it.effect("pins concurrent cached commands to their own verified credentials", () =>
     Effect.gen(function* () {
       mockRun.mockImplementation((input) =>
-        Effect.succeed(processOutput(input.env?.GH_TOKEN ?? "ambient")),
+        Effect.succeed(
+          processOutput(
+            input.command === "git"
+              ? ""
+              : input.args[0] === "auth" && input.args[1] === "status"
+                ? '{"hosts":{}}'
+                : (input.env?.GH_TOKEN ?? "ambient"),
+          ),
+        ),
       );
       const gh = yield* GitHubCli.GitHubCli;
       // Constructed outside either request, like the PR service's read caches.
@@ -567,9 +640,326 @@ describe("GitHubCli.layer", () => {
     assert.notProperty(commandFailure, "operation");
   });
 
+  it("extracts the one-time code from GitHub CLI device login output", () => {
+    assert.strictEqual(
+      GitHubCli.extractGitHubDeviceCode("! First copy your one-time code: ABCD-EFGH\n"),
+      "ABCD-EFGH",
+    );
+    assert.strictEqual(GitHubCli.extractGitHubDeviceCode("waiting for browser login"), null);
+  });
+
+  it.effect("returns the device code while the GitHub CLI login keeps running", () => {
+    const handle = ChildProcessSpawner.makeHandle({
+      pid: ChildProcessSpawner.ProcessId(42),
+      exitCode: Effect.never,
+      isRunning: Effect.succeed(true),
+      kill: () => Effect.void,
+      unref: Effect.succeed(Effect.void),
+      stdin: Sink.drain,
+      stdout: Stream.empty,
+      stderr: Stream.empty,
+      all: Stream.encodeText(
+        Stream.make("! First copy your one-time code: WXYZ-1234\nOpening github.com…\n"),
+      ),
+      getInputFd: () => Sink.drain,
+      getOutputFd: () => Stream.empty,
+    });
+    const loginLayer = GitHubCli.layer.pipe(
+      Layer.provide(
+        Layer.mock(VcsProcess.VcsProcess)({
+          run: mockRun,
+        }),
+      ),
+      Layer.provide(
+        Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.succeed(handle)),
+        ),
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const gh = yield* GitHubCli.GitHubCli;
+      const login = yield* gh.beginLogin({ cwd: "/repo" });
+      assert.deepStrictEqual(login, {
+        loginId: "github-login-1",
+        verificationUri: "https://github.com/login/device",
+        userCode: "WXYZ-1234",
+      });
+      assert.deepStrictEqual(yield* gh.getLoginStatus({ loginId: login.loginId }), {
+        status: "pending",
+      });
+    }).pipe(Effect.provide(loginLayer));
+  });
+
+  it.effect("reports a newly authenticated account when device login completes", () => {
+    let statusCalls = 0;
+    mockRun.mockImplementation((input) => {
+      if (input.command === "gh" && input.args.slice(0, 2).join(" ") === "auth status") {
+        statusCalls += 1;
+        return Effect.succeed(
+          processOutput(statusCalls === 1 ? githubAuthStatus([]) : githubAuthStatus(["new-user"])),
+        );
+      }
+      return Effect.succeed(processOutput(""));
+    });
+    const loginLayer = GitHubCli.layer.pipe(
+      Layer.provide(Layer.mock(VcsProcess.VcsProcess)({ run: mockRun })),
+      Layer.provide(
+        Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.succeed(completedLoginHandle())),
+        ),
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const gh = yield* GitHubCli.GitHubCli;
+      const login = yield* gh.beginLogin({ cwd: "/repo" });
+      yield* Effect.yieldNow;
+      assert.deepStrictEqual(yield* gh.getLoginStatus({ loginId: login.loginId }), {
+        status: "succeeded",
+        account: "new-user",
+        alreadyAuthenticated: false,
+      });
+    }).pipe(Effect.provide(loginLayer));
+  });
+
+  it.effect("reports when device login refreshes an existing account", () => {
+    mockRun.mockImplementation((input) => {
+      if (input.command === "gh" && input.args.slice(0, 2).join(" ") === "auth status") {
+        return Effect.succeed(processOutput(githubAuthStatus(["existing-user"])));
+      }
+      if (input.command === "gh" && input.args[0] === "api") {
+        return Effect.succeed(processOutput("existing-user\n"));
+      }
+      return Effect.succeed(processOutput(""));
+    });
+    const loginLayer = GitHubCli.layer.pipe(
+      Layer.provide(Layer.mock(VcsProcess.VcsProcess)({ run: mockRun })),
+      Layer.provide(
+        Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.succeed(completedLoginHandle())),
+        ),
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const gh = yield* GitHubCli.GitHubCli;
+      const login = yield* gh.beginLogin({ cwd: "/repo" });
+      yield* Effect.yieldNow;
+      assert.deepStrictEqual(yield* gh.getLoginStatus({ loginId: login.loginId }), {
+        status: "succeeded",
+        account: "existing-user",
+        alreadyAuthenticated: true,
+      });
+    }).pipe(Effect.provide(loginLayer));
+  });
+
+  it.effect("uses the token for the account selected by git config", () =>
+    Effect.gen(function* () {
+      const calls: VcsProcess.VcsProcessInput[] = [];
+      mockRun.mockImplementation((input) => {
+        calls.push(input);
+        if (input.command === "git") return Effect.succeed(processOutput("CyberStefNef\n"));
+        if (input.args[0] === "auth") return Effect.succeed(processOutput("selected-token\n"));
+        return Effect.succeed(processOutput('{"login":"CyberStefNef"}\n'));
+      });
+
+      const gh = yield* GitHubCli.GitHubCli;
+      const result = yield* gh.execute({ cwd: "/repo", args: ["api", "user"] });
+      yield* gh.execute({ cwd: "/repo", args: ["api", "user"] });
+
+      assert.include(result.stdout, "CyberStefNef");
+      assert.deepStrictEqual(calls[1]?.args, [
+        "auth",
+        "token",
+        "--hostname",
+        "github.com",
+        "--user",
+        "CyberStefNef",
+      ]);
+      assert.deepStrictEqual(calls[2]?.env, { GH_TOKEN: "selected-token" });
+      assert.notInclude(calls[2]?.args ?? [], "selected-token");
+      assert.strictEqual(calls.filter((call) => call.command === "git").length, 1);
+      assert.strictEqual(calls.filter((call) => call.args[0] === "auth").length, 1);
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("fails closed when the selected account is not authenticated", () =>
+    Effect.gen(function* () {
+      const tokenFailure = new VcsProcessExitError({
+        operation: "GitHubCli.resolveAccountToken",
+        command: "gh",
+        cwd: "/repo",
+        exitCode: 1,
+        failureKind: "authentication",
+        detail: "account is not authenticated",
+      });
+      mockRun.mockImplementation((input) =>
+        input.command === "git"
+          ? Effect.succeed(processOutput("work-user\n"))
+          : Effect.fail(tokenFailure),
+      );
+
+      const gh = yield* GitHubCli.GitHubCli;
+      const error = yield* gh.execute({ cwd: "/repo", args: ["api", "user"] }).pipe(Effect.flip);
+
+      assert.strictEqual(error._tag, "GitHubCliAuthenticationError");
+      if (error._tag !== "GitHubCliAuthenticationError") return;
+      assert.strictEqual(error.account, "work-user");
+      assert.include(error.detail, "selected for this project");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("uses the selected account when capturing a pull request credential", () =>
+    Effect.gen(function* () {
+      mockRun.mockImplementation((input) =>
+        Effect.succeed(processOutput(input.command === "git" ? "work-user\n" : "work-token\n")),
+      );
+      const gh = yield* GitHubCli.GitHubCli;
+      const result = yield* gh.execute({
+        cwd: "/repo",
+        args: ["auth", "token", "--hostname", "github.com"],
+        env: { GH_DEBUG: "" },
+      });
+      assert.strictEqual(result.stdout, "work-token");
+      const tokenCalls = mockRun.mock.calls.filter(([input]) => input.args[1] === "token");
+      assert.strictEqual(tokenCalls.length, 1);
+      assert.include(tokenCalls[0]?.[0].args ?? [], "work-user");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("keeps quota probes and reads on each repository's selected account", () =>
+    Effect.gen(function* () {
+      const reads: string[] = [];
+      mockRun.mockImplementation((input) => {
+        if (input.command === "git") return Effect.succeed(processOutput(input.cwd.slice(1)));
+        if (input.args[0] === "auth") {
+          return Effect.succeed(processOutput(`${input.args.at(-1)}-token`));
+        }
+        if (isBudgetReading(input)) {
+          return Effect.succeed(quotaOutput(input.env?.GH_TOKEN === "work-token" ? 0 : 5000));
+        }
+        reads.push(input.env?.GH_TOKEN ?? "ambient");
+        return Effect.succeed(processOutput("[]"));
+      });
+      const localLayer = GitHubCli.layer.pipe(
+        Layer.provide(Layer.mock(VcsProcess.VcsProcess)({ run: mockRun })),
+      );
+      yield* Effect.gen(function* () {
+        const gh = yield* GitHubCli.GitHubCli;
+        const read = (cwd: string) => gh.execute({ cwd, args: ["pr", "list"] });
+        assert.strictEqual(
+          (yield* read("/work").pipe(Effect.flip))._tag,
+          "GitHubCliRateLimitError",
+        );
+        yield* read("/personal");
+        assert.strictEqual(
+          (yield* read("/work").pipe(Effect.flip))._tag,
+          "GitHubCliRateLimitError",
+        );
+        assert.deepStrictEqual(reads, ["personal-token"]);
+      }).pipe(Effect.provide(localLayer));
+    }),
+  );
+
+  it.effect("requires a project selection when multiple accounts are authenticated", () =>
+    Effect.gen(function* () {
+      mockRun.mockImplementation((input) => {
+        if (input.command === "git") return Effect.succeed(processOutput(""));
+        if (input.args[0] === "auth" && input.args[1] === "status") {
+          return Effect.succeed(
+            processOutput(
+              JSON.stringify({
+                hosts: {
+                  "github.com": [
+                    {
+                      state: "success",
+                      active: true,
+                      host: "github.com",
+                      login: "personal-user",
+                    },
+                    {
+                      state: "success",
+                      active: false,
+                      host: "github.com",
+                      login: "work-user",
+                    },
+                  ],
+                },
+              }),
+            ),
+          );
+        }
+        return Effect.die(new Error(`Unexpected command: ${input.args.join(" ")}`));
+      });
+
+      const gh = yield* GitHubCli.GitHubCli;
+      const error = yield* gh.execute({ cwd: "/repo", args: ["api", "user"] }).pipe(Effect.flip);
+
+      assert.strictEqual(error._tag, "GitHubCliAuthenticationError");
+      assert.include(error.detail, "Choose an account for this project");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("distinguishes repository and inherited account bindings", () =>
+    Effect.gen(function* () {
+      mockRun.mockImplementation((input) =>
+        Effect.succeed(processOutput(input.args.includes("--local") ? "" : "directory-user\n")),
+      );
+
+      const gh = yield* GitHubCli.GitHubCli;
+      const inherited = yield* gh.getAccountBinding({ cwd: "/repo" });
+      assert.deepStrictEqual(inherited, { account: "directory-user", source: "inherited" });
+
+      mockRun.mockImplementation((input) =>
+        Effect.succeed(processOutput(input.args.includes("--local") ? "project-user\n" : "")),
+      );
+      const repository = yield* gh.getAccountBinding({ cwd: "/repo" });
+      assert.deepStrictEqual(repository, { account: "project-user", source: "repository" });
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("does not fall back when git config cannot be read", () =>
+    Effect.gen(function* () {
+      mockRun.mockImplementation((input) =>
+        input.command === "git"
+          ? Effect.succeed(processOutput("", 128))
+          : Effect.succeed(processOutput("unexpected")),
+      );
+
+      const gh = yield* GitHubCli.GitHubCli;
+      const error = yield* gh.execute({ cwd: "/repo", args: ["api", "user"] }).pipe(Effect.flip);
+
+      assert.strictEqual(error._tag, "GitHubCliCommandError");
+      assert.include(error.message, "GitHub CLI command failed");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("logs out only the requested GitHub CLI account", () =>
+    Effect.gen(function* () {
+      mockGhRun.mockReturnValueOnce(Effect.succeed(processOutput("")));
+
+      const gh = yield* GitHubCli.GitHubCli;
+      yield* gh.logoutAccount({ cwd: "/repo", host: "github.com", account: "personal-user" });
+
+      expect(mockGhRun).toHaveBeenCalledWith({
+        operation: "GitHubCli.logoutAccount",
+        command: "gh",
+        args: ["auth", "logout", "--hostname", "github.com", "--user", "personal-user"],
+        cwd: "/repo",
+        env: { GH_TOKEN: "", GITHUB_TOKEN: "" },
+        timeoutMs: 15_000,
+        maxOutputBytes: 4_000,
+      });
+    }).pipe(Effect.provide(layer)),
+  );
+
   it.effect("parses pull request view output", () =>
     Effect.gen(function* () {
-      mockRun.mockReturnValueOnce(
+      mockGhRun.mockReturnValueOnce(
         Effect.succeed(
           processOutput(
             // @effect-diagnostics-next-line preferSchemaOverJson:off
@@ -616,7 +1006,7 @@ describe("GitHubCli.layer", () => {
         headRepositoryNameWithOwner: "octocat/codething-mvp",
         headRepositoryOwnerLogin: "octocat",
       });
-      expect(mockRun).toHaveBeenCalledWith({
+      expect(mockGhRun).toHaveBeenCalledWith({
         operation: "GitHubCli.execute",
         command: "gh",
         args: [
@@ -634,7 +1024,7 @@ describe("GitHubCli.layer", () => {
 
   it.effect("trims pull request fields decoded from gh json", () =>
     Effect.gen(function* () {
-      mockRun.mockReturnValueOnce(
+      mockGhRun.mockReturnValueOnce(
         Effect.succeed(
           processOutput(
             // @effect-diagnostics-next-line preferSchemaOverJson:off
@@ -682,7 +1072,7 @@ describe("GitHubCli.layer", () => {
 
   it.effect("skips invalid entries when parsing pr lists", () =>
     Effect.gen(function* () {
-      mockRun.mockReturnValueOnce(
+      mockGhRun.mockReturnValueOnce(
         Effect.succeed(
           processOutput(
             // @effect-diagnostics-next-line preferSchemaOverJson:off
@@ -738,7 +1128,7 @@ describe("GitHubCli.layer", () => {
     // {id, name} only. These entries must decode instead of being dropped,
     // with nameWithOwner rebuilt from the owner login.
     Effect.gen(function* () {
-      mockRun.mockReturnValueOnce(
+      mockGhRun.mockReturnValueOnce(
         Effect.succeed(
           processOutput(
             // @effect-diagnostics-next-line preferSchemaOverJson:off
@@ -792,7 +1182,7 @@ describe("GitHubCli.layer", () => {
 
   it.effect("reads repository clone URLs", () =>
     Effect.gen(function* () {
-      mockRun.mockReturnValueOnce(
+      mockGhRun.mockReturnValueOnce(
         Effect.succeed(
           processOutput(
             // @effect-diagnostics-next-line preferSchemaOverJson:off
@@ -821,7 +1211,7 @@ describe("GitHubCli.layer", () => {
 
   it.effect("creates repositories and parses clone URLs from create output", () =>
     Effect.gen(function* () {
-      mockRun.mockReturnValueOnce(
+      mockGhRun.mockReturnValueOnce(
         Effect.succeed(
           processOutput(
             "✓ Created repository octocat/codething-mvp on github.com\nhttps://github.com/octocat/codething-mvp\n",
@@ -841,8 +1231,8 @@ describe("GitHubCli.layer", () => {
         url: "https://github.com/octocat/codething-mvp",
         sshUrl: "git@github.com:octocat/codething-mvp.git",
       });
-      expect(mockRun).toHaveBeenCalledTimes(1);
-      expect(mockRun).toHaveBeenNthCalledWith(1, {
+      expect(mockGhRun).toHaveBeenCalledTimes(1);
+      expect(mockGhRun).toHaveBeenNthCalledWith(1, {
         operation: "GitHubCli.execute",
         command: "gh",
         args: ["repo", "create", "octocat/codething-mvp", "--private"],
@@ -854,7 +1244,7 @@ describe("GitHubCli.layer", () => {
 
   it.effect("falls back to constructed URLs when create output omits a URL", () =>
     Effect.gen(function* () {
-      mockRun.mockReturnValueOnce(Effect.succeed(processOutput("")));
+      mockGhRun.mockReturnValueOnce(Effect.succeed(processOutput("")));
 
       const gh = yield* GitHubCli.GitHubCli;
       const result = yield* gh.createRepository({
@@ -882,7 +1272,7 @@ describe("GitHubCli.layer", () => {
         detail:
           "GraphQL: Could not resolve to a PullRequest with the number of 4888. (repository.pullRequest)",
       });
-      mockRun.mockReturnValueOnce(Effect.fail(cause));
+      mockGhRun.mockReturnValueOnce(Effect.fail(cause));
 
       const gh = yield* GitHubCli.GitHubCli;
       const error = yield* gh
@@ -913,7 +1303,7 @@ describe("GitHubCli.layer", () => {
         stderrLength: 82,
         stderrTruncated: false,
       });
-      mockRun.mockReturnValueOnce(Effect.fail(cause));
+      mockGhRun.mockReturnValueOnce(Effect.fail(cause));
 
       const gh = yield* GitHubCli.GitHubCli;
       const error = yield* gh
@@ -932,11 +1322,11 @@ describe("GitHubCli.layer", () => {
         .execute({ cwd: "/other-repo", args: ["pr", "list"] })
         .pipe(Effect.flip);
       assert.strictEqual(paused._tag, "GitHubCliRateLimitError");
-      expect(mockRun).toHaveBeenCalledTimes(1);
+      expect(mockGhRun).toHaveBeenCalledTimes(1);
       yield* TestClock.adjust("30 seconds");
-      mockRun.mockReturnValueOnce(Effect.succeed(processOutput("[]")));
+      mockGhRun.mockReturnValueOnce(Effect.succeed(processOutput("[]")));
       yield* gh.execute({ cwd: "/other-repo", args: ["pr", "list"] });
-      expect(mockRun).toHaveBeenCalledTimes(2);
+      expect(mockGhRun).toHaveBeenCalledTimes(2);
     }).pipe(Effect.provide(layer)),
   );
 });
@@ -946,6 +1336,7 @@ it.effect("accepts conditional 304 responses and preserves HTTP errors and retry
     const gh = yield* GitHubCli.GitHubCli;
     const request = {
       cwd: "/repo",
+      env: { GH_TOKEN: "test-token" },
       args: [
         "api",
         "repos/acme/web/pulls/1",

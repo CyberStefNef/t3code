@@ -259,6 +259,22 @@ it("accepts active authenticated GitHub accounts when another account fails", ()
       host: Option.some("github.com"),
     },
   );
+  assert.deepStrictEqual(auth.accounts, [
+    {
+      account: "active-user",
+      host: "github.com",
+      status: "authenticated",
+      active: true,
+      detail: Option.none(),
+    },
+    {
+      account: "stale-user",
+      host: "github.com",
+      status: "unauthenticated",
+      active: false,
+      detail: Option.some("The token in keyring is invalid."),
+    },
+  ]);
 });
 
 it("parses GitHub auth JSON from stdout when stderr has warnings", () => {

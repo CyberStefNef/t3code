@@ -17,6 +17,14 @@ Install [GitHub CLI](https://cli.github.com/) 2.81.0 or newer, then sign in:
 gh auth login
 ```
 
+Expand GitHub in **Settings → Source Control** to see every account or add and remove accounts.
+Choose an account for each checkout in **Project settings**. T3 Code stores the choice in the Git
+repository's `github.account` setting and asks you to choose when multiple accounts are available.
+Clone and publish flows also save the selected account in the repository.
+
+The selection applies to GitHub API actions such as browsing and creating pull requests. Commits
+still use `user.name` and `user.email`, while pushes use the remote URL's credentials.
+
 ### Forgejo and Gitea
 
 Install [Forgejo CLI (`fj`)](https://codeberg.org/forgejo-contrib/forgejo-cli) or

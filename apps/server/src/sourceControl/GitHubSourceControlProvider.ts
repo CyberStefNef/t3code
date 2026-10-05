@@ -54,12 +54,20 @@ function parseGitHubAuth(input: SourceControlAuthProbeInput) {
   const authStatus = parseGitHubAuthStatus(input.stdout);
   const authenticatedAccount = findAuthenticatedGitHubAccount(authStatus.accounts);
   const host = authenticatedAccount?.host;
+  const accounts = authStatus.accounts.map((account) => ({
+    account: account.account,
+    host: account.host,
+    status: account.authenticated ? ("authenticated" as const) : ("unauthenticated" as const),
+    active: account.active,
+    detail: account.error === null ? Option.none<string>() : Option.some(account.error),
+  }));
 
   if (authenticatedAccount) {
     return providerAuth({
       status: "authenticated",
       account: authenticatedAccount.account,
       host,
+      accounts,
     });
   }
 
@@ -71,6 +79,7 @@ function parseGitHubAuth(input: SourceControlAuthProbeInput) {
       detail:
         failedAccount?.error ??
         "Run `gh auth login` to authenticate GitHub CLI with an active account.",
+      accounts,
     });
   }
 
@@ -81,6 +90,7 @@ function parseGitHubAuth(input: SourceControlAuthProbeInput) {
       status: "unknown",
       detail:
         "GitHub CLI is too old to report sign-in status. Update `gh` to 2.81.0 or newer (for example `brew upgrade gh`) and rescan.",
+      accounts,
     });
   }
 
@@ -89,6 +99,7 @@ function parseGitHubAuth(input: SourceControlAuthProbeInput) {
       status: "unauthenticated",
       host,
       detail: firstSafeAuthLine(output) ?? "Run `gh auth login` to authenticate GitHub CLI.",
+      accounts,
     });
   }
 
@@ -96,6 +107,7 @@ function parseGitHubAuth(input: SourceControlAuthProbeInput) {
     status: "unknown",
     host,
     detail: firstSafeAuthLine(output) ?? "GitHub CLI auth status could not be parsed.",
+    accounts,
   });
 }
 

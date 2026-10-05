@@ -66,6 +66,7 @@ export const ProjectCloneStartInput = Schema.Struct({
   remoteUrl: Schema.optional(TrimmedNonEmptyString),
   destinationPath: TrimmedNonEmptyString,
   protocol: Schema.optional(SourceControlCloneProtocol),
+  githubAccount: Schema.optional(TrimmedNonEmptyString),
 });
 export type ProjectCloneStartInput = typeof ProjectCloneStartInput.Type;
 

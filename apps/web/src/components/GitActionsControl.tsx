@@ -97,6 +97,13 @@ import {
 } from "~/components/ui/menu";
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { ScrollArea } from "~/components/ui/scroll-area";
+import {
+  Select,
+  SelectItem,
+  SelectPopup,
+  SelectTrigger,
+  SelectValue,
+} from "~/components/ui/select";
 import { Textarea } from "~/components/ui/textarea";
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
@@ -535,9 +542,20 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
           input: {},
         }),
   );
+  const githubAccountBinding = useEnvironmentQuery(
+    props.environmentId === null
+      ? null
+      : sourceControlEnvironment.githubAccount({
+          environmentId: props.environmentId,
+          input: { cwd: props.gitCwd },
+        }),
+  );
   const [selectedPublishProvider, setSelectedPublishProvider] =
     useState<PublishProviderKind | null>(null);
   const [publishRepositoryOverride, setPublishRepositoryOverride] = useState<string | null>(null);
+  const [publishGitHubAccountOverride, setPublishGitHubAccountOverride] = useState<string | null>(
+    null,
+  );
   const [publishVisibility, setPublishVisibility] =
     useState<SourceControlRepositoryVisibility>("private");
   const [publishRemoteName, setPublishRemoteName] = useState("origin");
@@ -571,6 +589,19 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
     }
     return accounts;
   }, [sourceControlDiscovery.data]);
+  const publishGitHubAccounts = useMemo(
+    () =>
+      (
+        sourceControlDiscovery.data?.sourceControlProviders.find(
+          (provider) => provider.kind === "github",
+        )?.auth.accounts ?? []
+      ).filter((account) => account.host === "github.com" && account.status === "authenticated"),
+    [sourceControlDiscovery.data],
+  );
+  const publishGitHubAccount =
+    publishGitHubAccountOverride ??
+    githubAccountBinding.data?.account ??
+    (publishGitHubAccounts.length === 1 ? publishGitHubAccounts[0]!.account : null);
   const publishProviderReadiness = useMemo(() => {
     const sourceControlProviders = sourceControlDiscovery.data?.sourceControlProviders ?? [];
     return Object.fromEntries(
@@ -607,9 +638,14 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
       ? selectedPublishProvider
       : (firstReadyPublishProvider ?? selectedPublishProvider ?? "github");
   const selectedPublishProviderReadiness = publishProviderReadiness[publishProvider];
-  const publishRepositoryPrefill = publishAccountByProvider[publishProvider]
-    ? `${publishAccountByProvider[publishProvider]}/`
-    : "";
+  const publishRepositoryPrefill =
+    publishProvider === "github"
+      ? publishGitHubAccount
+        ? `${publishGitHubAccount}/`
+        : ""
+      : publishAccountByProvider[publishProvider]
+        ? `${publishAccountByProvider[publishProvider]}/`
+        : "";
   const publishRepository = publishRepositoryOverride ?? publishRepositoryPrefill;
   const currentPublishProvider = publishProviderOption(publishProvider);
   const publishHost =
@@ -632,12 +668,19 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
   const canSubmitPublishRepository = useMemo(() => {
     if (!selectedPublishProviderReadiness.ready) return false;
     if (publishRepositoryAction.isPending) return false;
+    if (publishProvider === "github" && publishGitHubAccount === null) return false;
     const repositoryParts = publishRepository.trim().split("/");
     const owner = repositoryParts[0]?.trim() ?? "";
     const rest = repositoryParts.slice(1);
     const name = rest.join("/").trim();
     return owner.length > 0 && name.length > 0;
-  }, [publishRepository, publishRepositoryAction.isPending, selectedPublishProviderReadiness]);
+  }, [
+    publishGitHubAccount,
+    publishProvider,
+    publishRepository,
+    publishRepositoryAction.isPending,
+    selectedPublishProviderReadiness,
+  ]);
 
   const submitPublishRepository = useCallback(() => {
     if (!canSubmitPublishRepository) {
@@ -653,6 +696,9 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
         visibility: publishVisibility,
         remoteName: publishRemoteName.trim() || "origin",
         protocol: publishProtocol,
+        ...(publishProvider === "github" && publishGitHubAccount
+          ? { githubAccount: publishGitHubAccount }
+          : {}),
       });
 
       if (result._tag === "Failure") {
@@ -673,6 +719,7 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
     props.environmentId,
     props.gitCwd,
     publishProtocol,
+    publishGitHubAccount,
     publishProvider,
     publishRemoteName,
     publishRepository,
@@ -683,6 +730,7 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
   const resetState = useCallback(() => {
     setPublishRemoteName("origin");
     setPublishRepositoryOverride(null);
+    setPublishGitHubAccountOverride(null);
     setPublishWizardStep(0);
     setPublishAdvancedOpen(false);
     setPublishError(null);
@@ -800,6 +848,48 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
           </div>
 
           <div className={cn("space-y-5", publishWizardStep !== 1 && "hidden")}>
+            {publishProvider === "github" ? (
+              <div className="space-y-2">
+                <label
+                  htmlFor="publish-github-account"
+                  className="text-xs font-medium text-foreground"
+                >
+                  GitHub account
+                </label>
+                <Select
+                  value={publishGitHubAccount ?? "__choose__"}
+                  onValueChange={(value) =>
+                    setPublishGitHubAccountOverride(value === "__choose__" ? null : String(value))
+                  }
+                  disabled={publishRepositoryAction.isPending}
+                >
+                  <SelectTrigger id="publish-github-account" className="w-full">
+                    <SelectValue>
+                      {publishGitHubAccount ?? "Choose the account that will own this repository"}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectPopup>
+                    {publishGitHubAccount === null ? (
+                      <SelectItem hideIndicator value="__choose__">
+                        Choose an account
+                      </SelectItem>
+                    ) : null}
+                    {publishGitHubAccounts.map((account) => (
+                      <SelectItem
+                        key={`${account.host}:${account.account}`}
+                        hideIndicator
+                        value={account.account}
+                      >
+                        {account.account}
+                      </SelectItem>
+                    ))}
+                  </SelectPopup>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  T3 saves this choice in the repository before creating it on GitHub.
+                </p>
+              </div>
+            ) : null}
             <div className="space-y-2">
               <label
                 htmlFor="publish-repository-path"

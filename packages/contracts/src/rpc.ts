@@ -324,11 +324,19 @@ import {
   ProjectCloneSubscribeInput,
 } from "./projectClone.ts";
 import {
+  GitHubAccountBinding,
+  GitHubAccountBindingInput,
+  GitHubAccountBindingUpdateInput,
+  GitHubAccountLogoutInput,
+  GitHubLoginStartResult,
+  GitHubLoginStatus,
+  GitHubLoginStatusInput,
   SourceControlCloneRepositoryInput,
   SourceControlCloneRepositoryResult,
   SourceControlDiscoveryResult,
   SourceControlPublishRepositoryInput,
   SourceControlPublishRepositoryResult,
+  SourceControlProviderError,
   SourceControlRepositoryError,
   SourceControlRepositoryInfo,
   SourceControlRepositoryLookupInput,
@@ -518,6 +526,11 @@ export const WS_METHODS = {
   projectCloneCancel: "projectClone.cancel",
   projectCloneRetry: "projectClone.retry",
   subscribeProjectClones: "subscribeProjectClones",
+  sourceControlGetGitHubAccount: "sourceControl.getGitHubAccount",
+  sourceControlSetGitHubAccount: "sourceControl.setGitHubAccount",
+  sourceControlStartGitHubLogin: "sourceControl.startGitHubLogin",
+  sourceControlGetGitHubLoginStatus: "sourceControl.getGitHubLoginStatus",
+  sourceControlLogoutGitHubAccount: "sourceControl.logoutGitHubAccount",
 
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
@@ -1122,7 +1135,52 @@ const WsSourceControlPublishRepositoryRpc = Rpc.make(WS_METHODS.sourceControlPub
   error: Schema.Union([SourceControlRepositoryError, EnvironmentAuthorizationError]),
 });
 
-const WsProjectsSearchEntriesRpc = Rpc.make(WS_METHODS.projectsSearchEntries, {
+export const WsSourceControlGetGitHubAccountRpc = Rpc.make(
+  WS_METHODS.sourceControlGetGitHubAccount,
+  {
+    payload: GitHubAccountBindingInput,
+    success: GitHubAccountBinding,
+    error: Schema.Union([SourceControlProviderError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsSourceControlSetGitHubAccountRpc = Rpc.make(
+  WS_METHODS.sourceControlSetGitHubAccount,
+  {
+    payload: GitHubAccountBindingUpdateInput,
+    success: GitHubAccountBinding,
+    error: Schema.Union([SourceControlProviderError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsSourceControlStartGitHubLoginRpc = Rpc.make(
+  WS_METHODS.sourceControlStartGitHubLogin,
+  {
+    payload: Schema.Struct({}),
+    success: GitHubLoginStartResult,
+    error: Schema.Union([SourceControlProviderError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsSourceControlGetGitHubLoginStatusRpc = Rpc.make(
+  WS_METHODS.sourceControlGetGitHubLoginStatus,
+  {
+    payload: GitHubLoginStatusInput,
+    success: GitHubLoginStatus,
+    error: Schema.Union([SourceControlProviderError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsSourceControlLogoutGitHubAccountRpc = Rpc.make(
+  WS_METHODS.sourceControlLogoutGitHubAccount,
+  {
+    payload: GitHubAccountLogoutInput,
+    success: Schema.Void,
+    error: Schema.Union([SourceControlProviderError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsProjectsSearchEntriesRpc = Rpc.make(WS_METHODS.projectsSearchEntries, {
   payload: ProjectSearchEntriesInput,
   success: ProjectSearchEntriesResult,
   error: Schema.Union([ProjectSearchEntriesError, EnvironmentAuthorizationError]),
@@ -1794,6 +1852,11 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectCloneCancelRpc,
   WsProjectCloneRetryRpc,
   WsSubscribeProjectClonesRpc,
+  WsSourceControlGetGitHubAccountRpc,
+  WsSourceControlSetGitHubAccountRpc,
+  WsSourceControlStartGitHubLoginRpc,
+  WsSourceControlGetGitHubLoginStatusRpc,
+  WsSourceControlLogoutGitHubAccountRpc,
   WsProjectsListEntriesRpc,
   WsProjectsReadFileRpc,
   WsProjectsSearchContentsRpc,

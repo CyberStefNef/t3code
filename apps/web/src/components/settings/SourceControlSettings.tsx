@@ -1,13 +1,23 @@
 import { RefreshIcon } from "~/components/ui/refresh-icon";
-import { ChevronDownIcon } from "lucide-react";
+import {
+  ChevronDownIcon,
+  CopyIcon,
+  EllipsisIcon,
+  ExternalLinkIcon,
+  PlusIcon,
+  RefreshCwIcon,
+} from "lucide-react";
 import * as Duration from "effect/Duration";
 import * as Option from "effect/Option";
 import { useEffect, useState, type ReactNode } from "react";
 import type {
   BackgroundActivitySettings,
+  EnvironmentId,
   SourceControlProviderKind,
   SourceControlDiscoveryResult,
   SourceControlProviderAuth,
+  SourceControlProviderAuthAccount,
+  GitHubLoginStartResult,
   SourceControlProviderDiscoveryItem,
   VcsDriverKind,
   VcsDiscoveryItem,
@@ -24,9 +34,16 @@ import { ProjectDefaultsSettings } from "./ProjectDefaultsSettings";
 import { cn } from "../../lib/utils";
 import { useEnvironmentQuery } from "../../state/query";
 import { sourceControlEnvironment } from "../../state/sourceControl";
+import { useAtomCommand } from "../../state/use-atom-command";
+import {
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
+import { readLocalApi } from "../../localApi";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Collapsible, CollapsibleContent } from "../ui/collapsible";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import {
   Empty,
   EmptyContent,
@@ -44,7 +61,17 @@ import {
   NumberFieldInput,
 } from "../ui/number-field";
 import { Switch } from "../ui/switch";
+import {
+  Dialog,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogPanel,
+  DialogPopup,
+  DialogTitle,
+} from "../ui/dialog";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { toastManager } from "../ui/toast";
 
 import {
   AzureDevOpsIcon,
@@ -222,6 +249,18 @@ function itemSummary({
 
   if (auth) {
     if (auth.status === "authenticated") {
+      if (item.kind === "github" && auth.accounts) {
+        const authenticatedAccountCount = auth.accounts.filter(
+          (account) => account.status === "authenticated",
+        ).length;
+        return (
+          <span>
+            {authenticatedAccountCount} {authenticatedAccountCount === 1 ? "account" : "accounts"}{" "}
+            authenticated
+          </span>
+        );
+      }
+
       return (
         <>
           <span>Authenticated</span>
@@ -259,6 +298,313 @@ function itemSummary({
   }
 
   return <span>Available</span>;
+}
+
+function GitHubAccountRow({
+  account,
+  logoutPending,
+  onSignOut,
+}: {
+  readonly account: SourceControlProviderAuthAccount;
+  readonly logoutPending: boolean;
+  readonly onSignOut: (account: SourceControlProviderAuthAccount) => void;
+}) {
+  const detail = optionLabel(account.detail);
+  const authenticated = account.status === "authenticated";
+  return (
+    <div className="grid min-h-9 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 rounded-lg px-1 py-1.5">
+      <div className="min-w-0 truncate text-xs leading-5 text-foreground">
+        <span className="inline-flex min-w-0 items-center">
+          <RedactedAccount account={account.account} />
+        </span>
+      </div>
+      <div className="flex items-center justify-end gap-1">
+        {!authenticated ? (
+          <Badge size="sm" variant="warning">
+            Sign-in required
+          </Badge>
+        ) : null}
+        <Menu>
+          <MenuTrigger
+            render={
+              <Button
+                size="icon-sm"
+                variant="ghost-muted"
+                className="size-7"
+                disabled={logoutPending}
+                aria-label={`Actions for ${account.account}`}
+              />
+            }
+          >
+            <EllipsisIcon className={cn("size-3.5", logoutPending && "animate-pulse")} />
+          </MenuTrigger>
+          <MenuPopup align="end" className="min-w-36">
+            <MenuItem
+              variant="destructive"
+              disabled={logoutPending}
+              onClick={() => onSignOut(account)}
+            >
+              {authenticated ? "Sign out" : "Remove account"}
+            </MenuItem>
+          </MenuPopup>
+        </Menu>
+      </div>
+      {detail ? (
+        <p className="col-span-2 min-w-0 truncate text-xs leading-5 text-warning">{detail}</p>
+      ) : null}
+    </div>
+  );
+}
+
+function GitHubAccounts({
+  auth,
+  environmentId,
+  onRefresh,
+}: {
+  readonly auth: SourceControlProviderAuth;
+  readonly environmentId: EnvironmentId;
+  readonly onRefresh: () => void;
+}) {
+  const accounts = auth.accounts ?? [];
+  const startGitHubLogin = useAtomCommand(sourceControlEnvironment.startGitHubLogin, {
+    reportFailure: false,
+  });
+  const getGitHubLoginStatus = useAtomCommand(sourceControlEnvironment.getGitHubLoginStatus, {
+    reportFailure: false,
+  });
+  const logoutGitHubAccount = useAtomCommand(sourceControlEnvironment.logoutGitHubAccount, {
+    reportFailure: false,
+  });
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginPending, setLoginPending] = useState(false);
+  const [login, setLogin] = useState<GitHubLoginStartResult | null>(null);
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [logoutPending, setLogoutPending] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!loginOpen || !login) return;
+    let disposed = false;
+    let checking = false;
+
+    const checkStatus = async () => {
+      if (disposed || checking) return;
+      checking = true;
+      const result = await getGitHubLoginStatus({
+        environmentId,
+        input: { loginId: login.loginId },
+      });
+      checking = false;
+      if (disposed || result._tag !== "Success" || result.value.status === "pending") return;
+
+      if (result.value.status === "failed") {
+        setLogin(null);
+        setLoginError(result.value.detail);
+        return;
+      }
+
+      setLogin(null);
+      setLoginOpen(false);
+      onRefresh();
+      toastManager.add({
+        type: "success",
+        title: result.value.alreadyAuthenticated
+          ? `${result.value.account} is already signed in`
+          : `${result.value.account} added`,
+        description: result.value.alreadyAuthenticated
+          ? "The existing account was kept; no duplicate was added."
+          : "The account is now available in Project settings.",
+      });
+    };
+
+    const initialCheck = window.setTimeout(() => void checkStatus(), 500);
+    const interval = window.setInterval(() => void checkStatus(), 1_000);
+    return () => {
+      disposed = true;
+      window.clearTimeout(initialCheck);
+      window.clearInterval(interval);
+    };
+  }, [environmentId, getGitHubLoginStatus, login, loginOpen, onRefresh]);
+
+  const beginLogin = async () => {
+    setLoginOpen(true);
+    setLoginPending(true);
+    setLogin(null);
+    setLoginError(null);
+    const result = await startGitHubLogin({ environmentId, input: {} });
+    setLoginPending(false);
+    if (result._tag === "Success") {
+      setLogin(result.value);
+      void readLocalApi()
+        ?.shell.openExternal(result.value.verificationUri)
+        .catch(() => undefined);
+      return;
+    }
+    if (!isAtomCommandInterrupted(result)) {
+      const error = squashAtomCommandFailure(result);
+      setLoginError(error instanceof Error ? error.message : "GitHub sign-in could not start.");
+    }
+  };
+
+  const copyUserCode = async () => {
+    if (!login) return;
+    try {
+      await navigator.clipboard.writeText(login.userCode);
+      toastManager.add({ type: "success", title: "GitHub code copied" });
+    } catch {
+      toastManager.add({
+        type: "error",
+        title: "Could not copy GitHub code",
+        description: "Select and copy the code manually.",
+      });
+    }
+  };
+
+  const signOutAccount = async (account: SourceControlProviderAuthAccount) => {
+    const authenticated = account.status === "authenticated";
+    const confirmed =
+      (await readLocalApi()?.dialogs.confirm(
+        `${authenticated ? "Sign out" : "Remove"} ${account.account}?\n\nProjects pinned to this account will require sign-in until you add it again.`,
+        { variant: "destructive" },
+      )) ?? false;
+    if (!confirmed) return;
+
+    const key = `${account.host}:${account.account}`;
+    setLogoutPending(key);
+    const result = await logoutGitHubAccount({
+      environmentId,
+      input: { account: account.account, host: account.host },
+    });
+    setLogoutPending(null);
+    if (result._tag === "Success") {
+      toastManager.add({
+        type: "success",
+        title: authenticated
+          ? `${account.account} signed out`
+          : `${account.account} removed from GitHub CLI`,
+      });
+      onRefresh();
+      return;
+    }
+    if (!isAtomCommandInterrupted(result)) {
+      const error = squashAtomCommandFailure(result);
+      toastManager.add({
+        type: "error",
+        title: authenticated
+          ? `Could not sign out ${account.account}`
+          : `Could not remove ${account.account}`,
+        description: error instanceof Error ? error.message : "GitHub CLI sign-out failed.",
+      });
+    }
+  };
+
+  return (
+    <>
+      <div className="grid gap-1">
+        <div className="flex items-center justify-between gap-3 px-1 py-1">
+          <div className="min-w-0">
+            <p className="text-xs font-medium text-foreground">Accounts</p>
+            <p className="text-xs text-muted-foreground">
+              Select an account for each project in Project settings.
+            </p>
+          </div>
+          <Button size="xs" variant="outline" onClick={() => void beginLogin()}>
+            <PlusIcon className="size-3.5" />
+            Add account
+          </Button>
+        </div>
+        {accounts.length > 0 ? (
+          <div className="grid gap-0.5">
+            {accounts.map((account) => (
+              <GitHubAccountRow
+                key={`${account.host}:${account.account}`}
+                account={account}
+                logoutPending={logoutPending === `${account.host}:${account.account}`}
+                onSignOut={(selected) => void signOutAccount(selected)}
+              />
+            ))}
+          </div>
+        ) : (
+          <p className="px-1 py-2 text-xs text-muted-foreground">
+            No GitHub CLI accounts were found on this server.
+          </p>
+        )}
+      </div>
+      <Dialog
+        open={loginOpen}
+        onOpenChange={(open) => {
+          setLoginOpen(open);
+          if (!open) {
+            setLogin(null);
+            setLoginError(null);
+          }
+        }}
+      >
+        <DialogPopup className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Add GitHub account</DialogTitle>
+            <DialogDescription>
+              Sign in with GitHub to add another account to T3 Code.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogPanel>
+            {loginPending ? (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <RefreshCwIcon className="size-4 animate-spin" />
+                Waiting for GitHub CLI…
+              </div>
+            ) : login ? (
+              <div className="space-y-2">
+                <p className="text-xs font-medium text-foreground">One-time code</p>
+                <button
+                  type="button"
+                  className="flex w-full items-center justify-between rounded-lg border border-border bg-muted/30 px-4 py-3 font-mono text-lg tracking-widest text-foreground"
+                  aria-label={`Copy GitHub one-time code ${login.userCode}`}
+                  onClick={() => void copyUserCode()}
+                >
+                  {login.userCode}
+                  <CopyIcon className="size-4 text-muted-foreground" />
+                </button>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  Enter this code on GitHub. This dialog closes when sign-in is complete.
+                </p>
+              </div>
+            ) : loginError ? (
+              <p className="rounded-lg bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
+                {loginError}
+              </p>
+            ) : null}
+          </DialogPanel>
+          <DialogFooter variant="bare">
+            {login ? (
+              <Button
+                variant="outline"
+                render={
+                  <a href={login.verificationUri} target="_blank" rel="noopener noreferrer" />
+                }
+              >
+                <ExternalLinkIcon className="size-4" />
+                Open GitHub
+              </Button>
+            ) : loginError ? (
+              <Button variant="outline" onClick={() => void beginLogin()}>
+                Try again
+              </Button>
+            ) : null}
+            {login ? (
+              <Button disabled>
+                <RefreshCwIcon className="size-4 animate-spin" />
+                Waiting for GitHub…
+              </Button>
+            ) : (
+              <Button disabled={loginPending} onClick={() => setLoginOpen(false)}>
+                Close
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogPopup>
+      </Dialog>
+    </>
+  );
 }
 
 function DiscoveryItemRow({
@@ -594,10 +940,15 @@ export function SourceControlSettingsPanel() {
             >
               {result.sourceControlProviders.map((item) => (
                 <DiscoveryItemRow key={`provider:${item.kind}`} item={item}>
-                  {item.kind === "bitbucket" ? (
+                  {item.kind === "github" && environmentId !== null ? (
+                    <GitHubAccounts
+                      auth={item.auth}
+                      environmentId={environmentId}
+                      onRefresh={handleScan}
+                    />
+                  ) : item.kind === "bitbucket" ? (
                     <SettingsSearchTarget id={searchableSetting("bitbucket-credentials").id}>
                       <BitbucketCredentialsSettings
-                        // Drafts belong to one environment; switching must not carry them over.
                         key={environmentId}
                         environmentId={environmentId}
                         onSaved={handleScan}

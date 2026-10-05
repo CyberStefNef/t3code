@@ -519,6 +519,20 @@ function createGitHubCliWithFakeGh(scenario: FakeGhScenario = {}): {
   return {
     service: {
       execute,
+      getAccountBinding: () => Effect.succeed({ account: null, source: "none" }),
+      setAccountBinding: (input) =>
+        Effect.succeed({
+          account: input.account,
+          source: input.account === null ? "none" : "repository",
+        }),
+      beginLogin: () =>
+        Effect.succeed({
+          loginId: "github-login-1",
+          verificationUri: "https://github.com/login/device",
+          userCode: "ABCD-EFGH",
+        }),
+      getLoginStatus: () => Effect.succeed({ status: "pending" as const }),
+      logoutAccount: () => Effect.void,
       // The fake answers the CLI shape, so batched lookups read it the way the fallback does.
       listPullRequestsByHead: (input) =>
         execute({

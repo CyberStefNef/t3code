@@ -24,6 +24,9 @@ import { useEnvironments, usePrimaryEnvironmentId } from "../../state/environmen
 import { useThreadShells } from "../../state/entities";
 import { projectEnvironment } from "../../state/projects";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { sourceControlEnvironment } from "../../state/sourceControl";
+import { useEnvironmentQuery } from "../../state/query";
+import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../ui/select";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { Alert, AlertDescription } from "../ui/alert";
 import { Button } from "../ui/button";
@@ -489,6 +492,11 @@ function ProjectDetail({
             }
           />
         </SettingsSection>
+        <SettingsSection title="GitHub accounts">
+          {group.memberProjects.map((member) => (
+            <ProjectGitHubAccount key={member.physicalProjectKey} member={member} />
+          ))}
+        </SettingsSection>
         <ProjectDefaultsSettings category="project" />
         <ProjectActionsSettings />
         {hasMultipleCheckouts ? checkoutChoices : null}
@@ -550,5 +558,121 @@ function ProjectDetail({
         </Suspense>
       ) : null}
     </>
+  );
+}
+
+function ProjectGitHubAccount({ member }: { member: SidebarProjectGroupMember }) {
+  const selectedCheckout = member;
+  const reportFailure = useCallback((title: string, result: AtomCommandResult<void, unknown>) => {
+    if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
+    const error = squashAtomCommandFailure(result);
+    toastManager.add(
+      stackedThreadToast({
+        type: "error",
+        title,
+        description: error instanceof Error ? error.message : "An error occurred.",
+      }),
+    );
+  }, []);
+  const githubDiscovery = useEnvironmentQuery(
+    sourceControlEnvironment.discovery({
+      environmentId: selectedCheckout.environmentId,
+      input: {},
+    }),
+  );
+  const githubAccountBinding = useEnvironmentQuery(
+    sourceControlEnvironment.githubAccount({
+      environmentId: selectedCheckout.environmentId,
+      input: { cwd: selectedCheckout.workspaceRoot },
+    }),
+  );
+  const setGitHubAccount = useAtomCommand(sourceControlEnvironment.setGitHubAccount, {
+    reportFailure: false,
+  });
+  const githubProvider = githubDiscovery.data?.sourceControlProviders.find(
+    (provider) => provider.kind === "github",
+  );
+  const githubAccounts = (githubProvider?.auth.accounts ?? []).filter(
+    (account) => account.host === "github.com" && account.status === "authenticated",
+  );
+  const selectedGitHubAccount = githubAccountBinding.data?.account ?? null;
+  const selectedGitHubAccountAvailable = githubAccounts.some(
+    (account) => account.account === selectedGitHubAccount,
+  );
+  const updateGitHubAccount = useCallback(
+    async (account: string | null) => {
+      const result = await setGitHubAccount({
+        environmentId: selectedCheckout.environmentId,
+        input: { cwd: selectedCheckout.workspaceRoot, account },
+      });
+      reportFailure(
+        "Failed to update GitHub account",
+        mapAtomCommandResult(result, () => undefined),
+      );
+      if (result._tag === "Success") githubAccountBinding.refresh();
+    },
+    [githubAccountBinding, reportFailure, selectedCheckout, setGitHubAccount],
+  );
+  return (
+    <SettingsRow
+      title={member.environmentLabel ?? "GitHub account"}
+      description={member.workspaceRoot}
+      resetAction={
+        githubAccountBinding.data?.source === "repository" ? (
+          <SettingResetButton
+            label="GitHub account"
+            onClick={() => void updateGitHubAccount(null)}
+          />
+        ) : null
+      }
+      control={
+        <Select
+          value={
+            githubAccountBinding.data?.source === "repository" && selectedGitHubAccount
+              ? selectedGitHubAccount
+              : "__inherit__"
+          }
+          disabled={githubAccountBinding.isPending}
+          onValueChange={(value) =>
+            void updateGitHubAccount(value === "__inherit__" ? null : String(value))
+          }
+        >
+          <SelectTrigger className="max-w-64" aria-label="GitHub account for checkout">
+            <SelectValue>
+              {githubAccountBinding.data?.source === "repository" && selectedGitHubAccount
+                ? selectedGitHubAccountAvailable
+                  ? selectedGitHubAccount
+                  : `${selectedGitHubAccount} (sign-in required)`
+                : githubAccountBinding.data?.source === "inherited" && selectedGitHubAccount
+                  ? `Git configuration (${selectedGitHubAccount})`
+                  : githubAccounts.length > 1
+                    ? "Choose an account"
+                    : githubAccounts[0]
+                      ? `Only signed-in account (${githubAccounts[0].account})`
+                      : "No GitHub account configured"}
+            </SelectValue>
+          </SelectTrigger>
+          <SelectPopup align="end" alignItemWithTrigger={false}>
+            <SelectItem hideIndicator value="__inherit__">
+              Use Git account configuration
+            </SelectItem>
+            {selectedGitHubAccount && !selectedGitHubAccountAvailable ? (
+              <SelectItem hideIndicator value={selectedGitHubAccount}>
+                {selectedGitHubAccount} (sign-in required)
+              </SelectItem>
+            ) : null}
+            {githubAccounts.map((account) => (
+              <SelectItem
+                key={`${account.host}:${account.account}`}
+                hideIndicator
+                value={account.account}
+              >
+                {account.account}
+              </SelectItem>
+            ))}
+          </SelectPopup>
+        </Select>
+      }
+    />
   );
 }

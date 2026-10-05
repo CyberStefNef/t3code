@@ -3029,6 +3029,36 @@ const makeWsRpcLayer = (
               "rpc.aggregate": "source-control",
             },
           ),
+        [WS_METHODS.sourceControlGetGitHubAccount]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.sourceControlGetGitHubAccount,
+            sourceControlRepositories.getGitHubAccount(input),
+            { "rpc.aggregate": "source-control" },
+          ),
+        [WS_METHODS.sourceControlSetGitHubAccount]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.sourceControlSetGitHubAccount,
+            sourceControlRepositories.setGitHubAccount(input),
+            { "rpc.aggregate": "source-control" },
+          ),
+        [WS_METHODS.sourceControlStartGitHubLogin]: (_input) =>
+          observeRpcEffect(
+            WS_METHODS.sourceControlStartGitHubLogin,
+            sourceControlRepositories.startGitHubLogin,
+            { "rpc.aggregate": "source-control" },
+          ),
+        [WS_METHODS.sourceControlGetGitHubLoginStatus]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.sourceControlGetGitHubLoginStatus,
+            sourceControlRepositories.getGitHubLoginStatus(input),
+            { "rpc.aggregate": "source-control" },
+          ),
+        [WS_METHODS.sourceControlLogoutGitHubAccount]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.sourceControlLogoutGitHubAccount,
+            sourceControlRepositories.logoutGitHubAccount(input),
+            { "rpc.aggregate": "source-control" },
+          ),
         [WS_METHODS.projectsSearchEntries]: (input) =>
           observeRpcEffect(
             WS_METHODS.projectsSearchEntries,
