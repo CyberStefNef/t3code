@@ -1796,6 +1796,27 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               [latestSkills],
             );
 
+            // Provider refresh must discover skills added after the first workspace probe.
+            const updatedSkills = [
+              { name: "new-skill", path: "/workspace/new/SKILL.md", enabled: true },
+            ];
+            yield* Ref.set(scopedResult, { ...scopedProvider, skills: updatedSkills });
+            yield* registry.refreshInstance(instanceId);
+            assert.strictEqual(yield* Ref.get(snapshotCalls), 7);
+            assert.deepStrictEqual(
+              (yield* registry.getProviders)[0]?.workspaceSnapshots?.[0]?.skills,
+              updatedSkills,
+            );
+
+            // A failed workspace probe preserves the last usable catalog.
+            yield* Ref.set(returnPendingSnapshot, true);
+            yield* registry.refreshInstance(instanceId);
+            assert.strictEqual(yield* Ref.get(snapshotCalls), 8);
+            assert.deepStrictEqual(
+              (yield* registry.getProviders)[0]?.workspaceSnapshots?.[0]?.skills,
+              updatedSkills,
+            );
+
             yield* Ref.set(instancesRef, [rebuiltInstance]);
             yield* PubSub.publish(registryChanges, undefined);
             let rebuilt = yield* registry.getProviders;

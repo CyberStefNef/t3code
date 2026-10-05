@@ -904,6 +904,7 @@ export const ProviderRegistryLive = Layer.effect(
       readonly instanceId: ProviderInstanceId;
       readonly cwd: string;
       readonly fresh?: boolean;
+      readonly refreshMachine?: boolean;
     }) {
       // Fresh scans drop other instances' snapshots for this cwd first, so a
       // composer on one of them scans again on next use, even when this
@@ -941,11 +942,12 @@ export const ProviderRegistryLive = Layer.effect(
       // A fresh scan never joins a running one, which may predate the change.
       if (!claimed && !input.fresh) return yield* Ref.get(providersRef);
       // Fresh scans also re-read the machine snapshot after invalidating caches.
-      const refreshMachineSnapshot = input.fresh
-        ? (instance.invalidateCaches ?? Effect.void).pipe(
-            Effect.andThen(refreshInstance(input.instanceId)),
-          )
-        : Effect.void;
+      const invalidateCaches = instance.invalidateCaches ?? Effect.void;
+      const refreshMachineSnapshot = !input.fresh
+        ? Effect.void
+        : input.refreshMachine === false
+          ? invalidateCaches
+          : invalidateCaches.pipe(Effect.andThen(refreshInstance(input.instanceId)));
       return yield* refreshMachineSnapshot.pipe(
         Effect.andThen(instance.snapshotForCwd(input.cwd)),
         Effect.flatMap((scopedSnapshot) =>
@@ -982,12 +984,50 @@ export const ProviderRegistryLive = Layer.effect(
       );
     });
 
+    const refreshWorkspaceSnapshots = Effect.fn("refreshWorkspaceSnapshots")(function* (
+      providers: ReadonlyArray<ServerProvider>,
+      instanceIds?: ReadonlySet<ProviderInstanceId>,
+    ) {
+      yield* Effect.forEach(
+        providers.filter(
+          (provider) => instanceIds === undefined || instanceIds.has(provider.instanceId),
+        ),
+        (provider) =>
+          Effect.forEach(
+            provider.workspaceSnapshots ?? [],
+            (workspace) =>
+              refreshWorkspaceSnapshot({
+                instanceId: provider.instanceId,
+                cwd: workspace.cwd,
+                fresh: true,
+                refreshMachine: false,
+              }),
+            { concurrency: 4, discard: true },
+          ),
+        { concurrency: "unbounded", discard: true },
+      );
+      return yield* Ref.get(providersRef);
+    });
+
     return {
       getProviders: Ref.get(providersRef),
       refresh: (provider?: ProviderDriverKind) =>
-        refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
+        refresh(provider).pipe(
+          Effect.flatMap((providers) =>
+            refreshWorkspaceSnapshots(
+              providers,
+              provider === undefined ? undefined : new Set([defaultInstanceIdForDriver(provider)]),
+            ),
+          ),
+          Effect.catchCause(recoverRefreshFailure),
+        ),
       refreshInstance: (instanceId: ProviderInstanceId) =>
-        refreshInstance(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
+        refreshInstance(instanceId).pipe(
+          Effect.flatMap((providers) =>
+            refreshWorkspaceSnapshots(providers, new Set([instanceId])),
+          ),
+          Effect.catchCause(recoverRefreshFailure),
+        ),
       refreshWorkspaceSnapshot: (input) =>
         refreshWorkspaceSnapshot(input).pipe(Effect.catchCause(recoverRefreshFailure)),
       getProviderMaintenanceCapabilitiesForInstance,
