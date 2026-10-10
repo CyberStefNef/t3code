@@ -10,6 +10,7 @@ import {
   resolveThreadDetailsCardDensity,
   resolveThreadDetailsCardLayout,
 } from "./threadDetailsCardLayout";
+import { observeResize } from "../../lib/observeResize";
 
 /** One card owns its placement and folds content only when that content cannot fit. */
 export function ThreadDetailsCard({
@@ -31,6 +32,7 @@ export function ThreadDetailsCard({
         container: canvas.container,
         lane: canvas.lane,
         frame: null,
+        topInset: canvas.detailsCardTopInset,
       })
     : null;
   const placement = canvas
@@ -39,6 +41,7 @@ export function ThreadDetailsCard({
         lane: canvas.lane,
         frame: canvas.layout.frame,
         overlapsDetailsCard: canvas.layout.overlapsDetailsCard,
+        topInset: canvas.detailsCardTopInset,
       })
     : null;
   const mode = placement ? "inline" : "popover";
@@ -53,6 +56,7 @@ export function ThreadDetailsCard({
   const [measurements, setMeasurements] = useState({
     key: measurementKey,
     heights: { full: 0, compact: 0 },
+    fullContentHeight: 0,
   });
   const contentHeights =
     measurements.key === measurementKey ? measurements.heights : { full: 0, compact: 0 };
@@ -64,8 +68,8 @@ export function ThreadDetailsCard({
     ? preferredPlacement.x + preferredPlacement.width
     : undefined;
   const cardBottom =
-    preferredPlacement && contentHeights.full > 0
-      ? preferredPlacement.y + Math.min(contentHeights.full, preferredPlacement.height)
+    preferredPlacement && measurements.key === measurementKey && measurements.fullContentHeight > 0
+      ? preferredPlacement.y + Math.min(measurements.fullContentHeight, preferredPlacement.height)
       : undefined;
   useLayoutEffect(() => {
     reportDetailsCard?.(
@@ -88,17 +92,31 @@ export function ThreadDetailsCard({
     const measure = () => {
       const frame = element.closest<HTMLElement>("[data-thread-details-card]");
       const next = element.offsetHeight + (frame ? frame.offsetHeight - frame.clientHeight : 0);
+      // Lineage scrolls as it expands. Counting it toward density would hide
+      // the section and workspace controls when the user asks to see more rows.
+      const lineage = element.querySelector<HTMLElement>("[data-thread-relationships-panel]");
+      const fittingHeight = next - (lineage?.offsetHeight ?? 0);
       setMeasurements((current) => {
         const heights = current.key === measurementKey ? current.heights : { full: 0, compact: 0 };
-        return current.key === measurementKey && heights[density] === next
+        const fullContentHeight =
+          density === "full"
+            ? next
+            : current.key === measurementKey
+              ? current.fullContentHeight
+              : 0;
+        return current.key === measurementKey &&
+          heights[density] === fittingHeight &&
+          current.fullContentHeight === fullContentHeight
           ? current
-          : { key: measurementKey, heights: { ...heights, [density]: next } };
+          : {
+              key: measurementKey,
+              heights: { ...heights, [density]: fittingHeight },
+              fullContentHeight,
+            };
       });
     };
     measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(element);
-    return () => observer.disconnect();
+    return observeResize(element, measure);
   }, [contentElement, density, measurementKey]);
   const card = (
     <div

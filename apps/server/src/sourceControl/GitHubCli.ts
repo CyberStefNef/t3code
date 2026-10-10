@@ -1,4 +1,6 @@
-import * as NodeCrypto from "node:crypto";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as Crypto from "effect/Crypto";
+import * as Hex from "effect/encoding/Hex";
 import * as Cache from "effect/Cache";
 import * as Clock from "effect/Clock";
 import * as Exit from "effect/Exit";
@@ -17,7 +19,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import {
   TrimmedNonEmptyString,
@@ -34,7 +36,7 @@ import { decodeJsonResult } from "@t3tools/shared/schemaJson";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import { parseGitHubAuthStatus } from "./gitHubAuthStatus.ts";
 import * as GitHubGraphQlBudget from "./githubGraphQlBudget.ts";
-import * as SourceControlRateLimit from "./SourceControlRateLimit.ts";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import {
   decodeGitHubPullRequestEntries,
   decodeGitHubPullRequestJson,
@@ -1086,6 +1088,7 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  const crypto = yield* Crypto.Crypto;
   const budget = yield* GitHubGraphQlBudget.GitHubGraphQlBudget;
   const limits = yield* SourceControlRateLimit.SourceControlRateLimit;
 
@@ -1251,7 +1254,7 @@ export const make = Effect.gen(function* () {
       const fingerprint =
         credential?.credentialFingerprint ??
         (selectedToken
-          ? `${input.host}:${NodeCrypto.createHash("sha256").update(selectedToken).digest("hex")}`
+          ? `${input.host}:${yield* crypto.digest("SHA-256", new TextEncoder().encode(selectedToken)).pipe(Effect.map(Hex.encode), Effect.orDie)}`
           : "");
       const key = { provider: "github" as const, host: input.host };
       const guarded = Effect.gen(function* () {
@@ -1659,6 +1662,7 @@ export const make = Effect.gen(function* () {
 });
 
 export const layer = Layer.effect(GitHubCli, make).pipe(
+  Layer.provide(NodeCrypto.layer),
   Layer.provideMerge(GitHubGraphQlBudget.layer),
   Layer.provideMerge(SourceControlRateLimit.layer),
 );

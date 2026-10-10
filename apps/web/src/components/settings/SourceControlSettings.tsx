@@ -16,7 +16,6 @@ import type {
   SourceControlProviderKind,
   SourceControlDiscoveryResult,
   SourceControlProviderAuth,
-  SourceControlProviderAuthAccount,
   GitHubLoginStartResult,
   SourceControlProviderDiscoveryItem,
   VcsDriverKind,
@@ -76,6 +75,7 @@ import { toastManager } from "../ui/toast";
 import {
   AzureDevOpsIcon,
   BitbucketIcon,
+  GitCafeIcon,
   GitHubIcon,
   GitIcon,
   GitLabIcon,
@@ -84,6 +84,8 @@ import {
   type Icon,
 } from "../Icons";
 import { BitbucketCredentialsSettings } from "./BitbucketCredentialsSettings";
+import { GitHubAccountSettings } from "./GitHubAccountSettings";
+import { GitHubTokenSettings } from "./GitHubTokenSettings";
 import { RedactedSensitiveText } from "./RedactedSensitiveText";
 import { SourceControlWritingSettingsSection } from "./SourceControlWritingSettings";
 import {
@@ -108,6 +110,7 @@ const SOURCE_CONTROL_PROVIDER_ICONS: Partial<Record<SourceControlProviderKind, I
   forgejo: ForgejoIcon,
   "azure-devops": AzureDevOpsIcon,
   bitbucket: BitbucketIcon,
+  gitcafe: GitCafeIcon,
 };
 
 const VCS_ICONS: Partial<Record<VcsDriverKind, Icon>> = {
@@ -251,7 +254,7 @@ function itemSummary({
     if (auth.status === "authenticated") {
       if (item.kind === "github" && auth.accounts) {
         const authenticatedAccountCount = auth.accounts.filter(
-          (account) => account.status === "authenticated",
+          (account) => account.authenticated,
         ).length;
         return (
           <span>
@@ -261,6 +264,9 @@ function itemSummary({
         );
       }
 
+      // The server names the account its requests use, Settings choice included, and
+      // says when an environment token overrides it.
+      const authDetail = optionLabel(auth.detail);
       return (
         <>
           <span>Authenticated</span>
@@ -270,6 +276,7 @@ function itemSummary({
               <RedactedAccount account={authAccount} />
             </>
           ) : null}
+          {authDetail ? <span>· {authDetail}</span> : null}
         </>
       );
     }
@@ -278,6 +285,11 @@ function itemSummary({
     // through to the "could not verify" detail instead of repeating the setup hint.
     if (!item.executable && auth.status === "unauthenticated") {
       return <span>Available. {item.installHint}</span>;
+    }
+
+    // Signed in, but every login is turned off here: the fix is the switch below, not the CLI.
+    if (auth.status === "unauthenticated" && auth.accounts?.some((entry) => entry.authenticated)) {
+      return <span>{optionLabel(auth.detail) ?? `Every ${item.label} host is turned off.`}</span>;
     }
 
     if (auth.status === "unauthenticated") {
@@ -305,12 +317,12 @@ function GitHubAccountRow({
   logoutPending,
   onSignOut,
 }: {
-  readonly account: SourceControlProviderAuthAccount;
+  readonly account: NonNullable<SourceControlProviderAuth["accounts"]>[number];
   readonly logoutPending: boolean;
-  readonly onSignOut: (account: SourceControlProviderAuthAccount) => void;
+  readonly onSignOut: (account: NonNullable<SourceControlProviderAuth["accounts"]>[number]) => void;
 }) {
-  const detail = optionLabel(account.detail);
-  const authenticated = account.status === "authenticated";
+  const detail = account.error ?? null;
+  const authenticated = account.authenticated;
   return (
     <div className="grid min-h-9 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 rounded-lg px-1 py-1.5">
       <div className="min-w-0 truncate text-xs leading-5 text-foreground">
@@ -459,8 +471,10 @@ function GitHubAccounts({
     }
   };
 
-  const signOutAccount = async (account: SourceControlProviderAuthAccount) => {
-    const authenticated = account.status === "authenticated";
+  const signOutAccount = async (
+    account: NonNullable<SourceControlProviderAuth["accounts"]>[number],
+  ) => {
+    const authenticated = account.authenticated;
     const confirmed =
       (await readLocalApi()?.dialogs.confirm(
         `${authenticated ? "Sign out" : "Remove"} ${account.account}?\n\nProjects pinned to this account will require sign-in until you add it again.`,
@@ -629,7 +643,8 @@ function DiscoveryItemRow({
     if (
       (item.kind === "git" && searchTargetId === searchableSetting("git-fetch-interval").id) ||
       (item.kind === "bitbucket" &&
-        searchTargetId === searchableSetting("bitbucket-credentials").id)
+        searchTargetId === searchableSetting("bitbucket-credentials").id) ||
+      (item.kind === "github" && searchTargetId === searchableSetting("github-accounts").id)
     ) {
       setIsExpanded(true);
     }
@@ -953,6 +968,25 @@ export function SourceControlSettingsPanel() {
                         environmentId={environmentId}
                         onSaved={handleScan}
                       />
+                    </SettingsSearchTarget>
+                  ) : item.kind === "github" ? (
+                    <SettingsSearchTarget id={searchableSetting("github-accounts").id}>
+                      <div className="grid gap-6">
+                        {/* Shown even without gh: a saved token is how GitHub works without the CLI. */}
+                        <GitHubTokenSettings
+                          key={`token-${environmentId}`}
+                          environmentId={environmentId}
+                          onSaved={handleScan}
+                        />
+                        {item.status === "available" ? (
+                          <GitHubAccountSettings
+                            key={environmentId}
+                            environmentId={environmentId}
+                            auth={item.auth}
+                            onSaved={handleScan}
+                          />
+                        ) : null}
+                      </div>
                     </SettingsSearchTarget>
                   ) : undefined}
                 </DiscoveryItemRow>

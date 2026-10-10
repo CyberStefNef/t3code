@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it, afterEach, describe, expect, vi } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
@@ -12,13 +13,13 @@ import * as DateTime from "effect/DateTime";
 import * as Fiber from "effect/Fiber";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
-import { ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcessSpawner } from "effect/process";
 import { VcsProcessExitError, VcsProcessSpawnError } from "@t3tools/contracts";
 
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as GitHubCli from "./GitHubCli.ts";
 import * as GitHubGraphQlBudget from "./githubGraphQlBudget.ts";
-import * as SourceControlRateLimit from "./SourceControlRateLimit.ts";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 
 const encodeGitHubCliError = Schema.encodeEffect(Schema.fromJsonString(GitHubCli.GitHubCliError));
 
@@ -123,6 +124,7 @@ it.effect("reads the GraphQL budget once per window, preserves the reserve, and 
       DateTime.makeUnsafe((yield* Clock.currentTimeMillis) + 60_000),
     );
     const gh = yield* GitHubCli.make.pipe(
+      Effect.provide(NodeCrypto.layer),
       Effect.provideService(VcsProcess.VcsProcess, {
         run: (input) =>
           Effect.sync(() => {
@@ -171,6 +173,7 @@ it.effect("reads the budget again at a near reset, and every ten minutes in a lo
     const startedAt = yield* Clock.currentTimeMillis;
     let resetAt = DateTime.formatIso(DateTime.makeUnsafe(startedAt + 10_000));
     const gh = yield* GitHubCli.make.pipe(
+      Effect.provide(NodeCrypto.layer),
       Effect.provideService(VcsProcess.VcsProcess, {
         run: (input) =>
           Effect.sync(() => {
@@ -199,6 +202,7 @@ it.effect("reads the budget again at a near reset, and every ten minutes in a lo
 it.effect("reads anyway when the budget reading fails", () =>
   Effect.gen(function* () {
     const gh = yield* GitHubCli.make.pipe(
+      Effect.provide(NodeCrypto.layer),
       Effect.provideService(VcsProcess.VcsProcess, {
         run: (input) =>
           isBudgetReading(input)
@@ -480,6 +484,7 @@ describe("GitHubCli.layer", () => {
     Effect.gen(function* () {
       let reads = 0;
       const gh = yield* GitHubCli.make.pipe(
+        Effect.provide(NodeCrypto.layer),
         Effect.provideService(VcsProcess.VcsProcess, {
           run: (input) =>
             Effect.sync(() => {
@@ -962,7 +967,6 @@ describe("GitHubCli.layer", () => {
       mockGhRun.mockReturnValueOnce(
         Effect.succeed(
           processOutput(
-            // @effect-diagnostics-next-line preferSchemaOverJson:off
             JSON.stringify({
               number: 42,
               title: "Add PR thread creation",
@@ -1027,7 +1031,6 @@ describe("GitHubCli.layer", () => {
       mockGhRun.mockReturnValueOnce(
         Effect.succeed(
           processOutput(
-            // @effect-diagnostics-next-line preferSchemaOverJson:off
             JSON.stringify({
               number: 42,
               title: "  Add PR thread creation  \n",
@@ -1075,7 +1078,6 @@ describe("GitHubCli.layer", () => {
       mockGhRun.mockReturnValueOnce(
         Effect.succeed(
           processOutput(
-            // @effect-diagnostics-next-line preferSchemaOverJson:off
             JSON.stringify([
               {
                 number: 0,
@@ -1131,7 +1133,6 @@ describe("GitHubCli.layer", () => {
       mockGhRun.mockReturnValueOnce(
         Effect.succeed(
           processOutput(
-            // @effect-diagnostics-next-line preferSchemaOverJson:off
             JSON.stringify([
               {
                 number: 2829,
@@ -1185,7 +1186,6 @@ describe("GitHubCli.layer", () => {
       mockGhRun.mockReturnValueOnce(
         Effect.succeed(
           processOutput(
-            // @effect-diagnostics-next-line preferSchemaOverJson:off
             JSON.stringify({
               nameWithOwner: "octocat/codething-mvp",
               url: "https://github.com/octocat/codething-mvp",
