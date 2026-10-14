@@ -1,3 +1,4 @@
+import { SourceControlProviderKind } from "@t3tools/contracts";
 import type {
   ProjectCloneSnapshot,
   ProjectCloneStage,
@@ -5,7 +6,6 @@ import type {
   ProjectCloneStartResult,
   ProjectId,
   SourceControlRepositoryInfo,
-  SourceControlProviderKind,
 } from "@t3tools/contracts";
 import {
   OrchestrationDispatchCommandError,
@@ -311,7 +311,7 @@ export const make = Effect.gen(function* () {
       if (!claimed) {
         return yield* new SourceControlRepositoryError({
           operation: "cloneRepository",
-          provider: input.provider ?? "unknown",
+          provider: input.provider ?? SourceControlProviderKind.make("unknown"),
           detail: "A clone into this destination is already in progress.",
         });
       }

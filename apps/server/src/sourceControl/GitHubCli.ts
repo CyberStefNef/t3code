@@ -1,3 +1,4 @@
+import { SourceControlProviderKind } from "@t3tools/contracts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as Crypto from "effect/Crypto";
 import * as Hex from "effect/encoding/Hex";
@@ -1256,7 +1257,7 @@ export const make = Effect.gen(function* () {
         (selectedToken
           ? `${input.host}:${yield* crypto.digest("SHA-256", new TextEncoder().encode(selectedToken)).pipe(Effect.map(Hex.encode), Effect.orDie)}`
           : "");
-      const key = { provider: "github" as const, host: input.host };
+      const key = { provider: SourceControlProviderKind.make("github"), host: input.host };
       const guarded = Effect.gen(function* () {
         const lease = yield* limits.check(
           key,

@@ -1,3 +1,4 @@
+import { SourceControlProviderKind } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -107,7 +108,7 @@ export const make = Effect.gen(function* () {
       });
       if (retryAt !== null) {
         return yield* new SourceControlRateLimit.SourceControlRateLimitPausedError({
-          provider: "github",
+          provider: SourceControlProviderKind.make("github"),
           host: hostKey(host),
           retryAt,
         });
