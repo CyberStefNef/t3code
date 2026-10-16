@@ -1,4 +1,5 @@
 import { SettingsGroup } from "./SettingsGroup";
+import { settingsScopeEnvironmentLabels } from "./settingsScopeAxis";
 import { useScopedSettingsWriteAllowed } from "./useScopedSettings";
 import { Spinner } from "~/components/ui/spinner";
 import { NotificationSettings } from "./NotificationSettings";
@@ -54,7 +55,6 @@ import * as Duration from "effect/Duration";
 import * as Equal from "effect/Equal";
 import * as Schema from "effect/Schema";
 import { APP_VERSION, HOSTED_APP_CHANNEL, HOSTED_APP_CHANNEL_LABEL } from "../../branding";
-import { IS_NIGHTLY_BUILD, NightlyMobileBetaRow } from "../NightlyMobileBeta";
 import { CliCommandSettingsRow } from "./CliCommandSettingsRow";
 import {
   canCheckForUpdate,
@@ -286,9 +286,6 @@ function AboutVersionSection() {
   const hasDesktopBridge = typeof window !== "undefined" && Boolean(window.desktopBridge);
   const selectedUpdateChannel = updateState?.channel ?? "latest";
   const selectedHostedAppChannel = hasDesktopBridge ? null : HOSTED_APP_CHANNEL;
-  // Show the beta app links as soon as someone picks Nightly, before the update installs.
-  const showNightlyMobileBeta =
-    IS_NIGHTLY_BUILD || (hasDesktopBridge && selectedUpdateChannel === "nightly");
 
   const handleUpdateChannelChange = useCallback(
     (channel: DesktopUpdateChannel) => {
@@ -510,7 +507,6 @@ function AboutVersionSection() {
           }
         />
       ) : null}
-      {showNightlyMobileBeta ? <NightlyMobileBetaRow /> : null}
       {hasDesktopBridge ? <CliCommandSettingsRow /> : null}
     </>
   );
@@ -581,6 +577,10 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.sidebarAutoSettleAfterDays !==
       DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleAfterDays
         ? ["Auto-settle inactive threads"]
+        : []),
+      ...(settings.sidebarAutoSettleKeepPullRequests !==
+      DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleKeepPullRequests
+        ? ["Keep threads with a PR"]
         : []),
       ...(settings.sidebarAutoSettleOnMerge !== DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge
         ? ["Auto-settle merged threads"]
@@ -672,6 +672,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.browserRecordingShowMousePresses,
       settings.browserLinkTarget,
       settings.browserAutoShowFloatingPreview,
+      settings.pullRequestLinksOpenInApp,
       settings.appearanceContrast,
       settings.diffColorScheme,
       settings.chatWidth,
@@ -708,6 +709,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.enableProviderUpdateChecks,
       settings.continueThreadsAfterServerUpdate,
       settings.sidebarAutoSettleAfterDays,
+      settings.sidebarAutoSettleKeepPullRequests,
       settings.sidebarAutoSettleOnMerge,
       settings.autoResumeLimitedThreads,
       settings.snoozeLimitedThreads,
@@ -815,6 +817,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       sidebarProjectSortOrder: DEFAULT_UNIFIED_SETTINGS.sidebarProjectSortOrder,
       sidebarWorkingShelfEnabled: DEFAULT_UNIFIED_SETTINGS.sidebarWorkingShelfEnabled,
       sidebarAutoSettleAfterDays: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleAfterDays,
+      sidebarAutoSettleKeepPullRequests: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleKeepPullRequests,
       sidebarAutoSettleOnMerge: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge,
       autoResumeLimitedThreads: DEFAULT_UNIFIED_SETTINGS.autoResumeLimitedThreads,
       snoozeLimitedThreads: DEFAULT_UNIFIED_SETTINGS.snoozeLimitedThreads,
@@ -849,6 +852,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       browserRecordingShowMousePresses: DEFAULT_UNIFIED_SETTINGS.browserRecordingShowMousePresses,
       browserLinkTarget: DEFAULT_UNIFIED_SETTINGS.browserLinkTarget,
       browserAutoShowFloatingPreview: DEFAULT_UNIFIED_SETTINGS.browserAutoShowFloatingPreview,
+      pullRequestLinksOpenInApp: DEFAULT_UNIFIED_SETTINGS.pullRequestLinksOpenInApp,
       // Re-granted like any other default. The confirmation dialog lists it by
       // name, so a user restoring defaults is told the agent regains access
       // rather than discovering it later.
@@ -998,7 +1002,8 @@ function BackgroundActivityAdvancedDialog({
               <div className="min-w-0 space-y-1">
                 <div className="text-sm font-medium">Provider health interval</div>
                 <p className="text-xs leading-relaxed text-muted-foreground">
-                  Refresh provider availability, versions, auth state, and model metadata.
+                  Refresh provider availability, versions, and auth state. Model catalog updates
+                  follow Provider update checks.
                 </p>
               </div>
               <div className="flex shrink-0 items-center gap-2">
@@ -2202,6 +2207,9 @@ export function GeneralSettingsPanel() {
     connectedEnvironments.every(
       (target) => target.serverConfig?.environment.capabilities.threadAutoSettlement === true,
     );
+  const supportsAutoSettlementScope = connectedEnvironments.every(
+    (target) => target.serverConfig?.environment.capabilities.threadAutoSettlementScope === true,
+  );
   const supportsRestartContinuation =
     connectedEnvironments.length > 0 &&
     connectedEnvironments.every(
@@ -2478,6 +2486,24 @@ export function GeneralSettingsPanel() {
                   <AutoSettleDaysInput
                     value={settings.sidebarAutoSettleAfterDays}
                     onCommit={(days) => updateSettings({ sidebarAutoSettleAfterDays: days })}
+                  />
+                }
+              />
+            ) : null}
+            {settings.sidebarAutoSettleAfterDays !== null && supportsAutoSettlementScope ? (
+              <SettingsRow
+                serverScoped
+                settingKeys={["sidebarAutoSettleKeepPullRequests"]}
+                title="Keep threads with a PR"
+                description="Inactivity does not settle threads with a pull request. Merge and close still do."
+                control={
+                  <ScopedSwitch
+                    settingKeys={["sidebarAutoSettleKeepPullRequests"]}
+                    checked={settings.sidebarAutoSettleKeepPullRequests}
+                    onCheckedChange={(checked) =>
+                      updateSettings({ sidebarAutoSettleKeepPullRequests: checked })
+                    }
+                    aria-label="Keep threads with a PR"
                   />
                 }
               />
@@ -2889,7 +2915,7 @@ export function GeneralSettingsPanel() {
           serverScoped
           settingKeys={["enableProviderUpdateChecks"]}
           {...searchableSetting("provider-update-checks")}
-          description="Check installed provider CLIs for newer available versions."
+          description="Check installed provider CLIs for newer available versions and fetch model catalog updates. When off, new models may not appear."
           resetAction={
             settings.enableProviderUpdateChecks !==
             DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks ? (
@@ -3355,7 +3381,6 @@ export function GeneralSettingsPanel() {
               title={<AboutVersionTitle />}
               description="Current version of the application."
             />
-            {IS_NIGHTLY_BUILD ? <NightlyMobileBetaRow /> : null}
           </>
         )}
         <SettingsRow
@@ -3413,7 +3438,7 @@ export function GeneralSettingsPanel() {
 }
 
 export function ArchivedThreadsPanel() {
-  const { scope } = useSettingsScope();
+  const { scope, groups: projectGroups, environments } = useSettingsScope();
   const { unarchiveThread, confirmAndDeleteThread } = useThreadActions();
   const {
     snapshots: archivedSnapshots,
@@ -3422,7 +3447,7 @@ export function ArchivedThreadsPanel() {
     refresh: refreshArchivedThreads,
   } = useArchivedThreadSnapshots(scope.environmentIds);
 
-  const archivedGroups = useMemo(() => {
+  const { groups: archivedGroups, hasMultipleEnvironments } = useMemo(() => {
     const selectedProjectKeys =
       scope.kind === "project" || scope.kind === "checkout"
         ? new Set(scope.members.map((member) => `${member.environmentId}:${member.id}`))
@@ -3440,15 +3465,43 @@ export function ArchivedThreadsPanel() {
           ),
       ),
     );
+    const environmentLabels = new Map(
+      environments.map((environment) => {
+        const { primary, secondary } = settingsScopeEnvironmentLabels(environment, environments);
+        return [environment.environmentId, secondary ? `${primary} (${secondary})` : primary];
+      }),
+    );
     const threads = archivedSnapshots.flatMap(({ environmentId, snapshot }) =>
-      snapshot.threads.map((thread) => presentThreadShell(environmentId, thread)),
+      snapshot.threads.map((thread) => ({
+        ...presentThreadShell(environmentId, thread),
+        environmentLabel: environmentLabels.get(environmentId) ?? environmentId,
+      })),
+    );
+    const hasMultipleEnvironments =
+      new Set(
+        threads
+          .filter((thread) =>
+            projectsByEnvironmentAndId.has(`${thread.environmentId}:${thread.projectId}`),
+          )
+          .map((thread) => thread.environmentId),
+      ).size > 1;
+    const logicalGroupsByProjectKey = new Map(
+      projectGroups.flatMap((group) =>
+        group.memberProjectRefs.map(
+          (member) => [`${member.environmentId}:${member.projectId}`, group] as const,
+        ),
+      ),
     );
 
     const archivedProjects = Array.from(projectsByEnvironmentAndId.values());
-    const groups: Array<{
-      readonly project: (typeof archivedProjects)[number];
-      readonly threads: Array<(typeof threads)[number]>;
-    }> = [];
+    const groups = new Map<
+      string,
+      {
+        readonly project: (typeof archivedProjects)[number];
+        readonly title: string;
+        readonly threads: Array<(typeof threads)[number]>;
+      }
+    >();
     for (const project of archivedProjects) {
       const projectThreads: Array<(typeof threads)[number]> = [];
       for (const thread of threads) {
@@ -3457,18 +3510,34 @@ export function ArchivedThreadsPanel() {
         }
       }
       if (projectThreads.length > 0) {
-        groups.push({
-          project,
-          threads: projectThreads.toSorted((left, right) => {
-            const leftKey = left.archivedAt ?? left.createdAt;
-            const rightKey = right.archivedAt ?? right.createdAt;
-            return rightKey.localeCompare(leftKey) || right.id.localeCompare(left.id);
-          }),
-        });
+        const physicalProjectKey = `${project.environmentId}:${project.id}` as const;
+        const logicalGroup = hasMultipleEnvironments
+          ? logicalGroupsByProjectKey.get(physicalProjectKey)
+          : undefined;
+        const groupKey = logicalGroup?.projectKey ?? physicalProjectKey;
+        const group = groups.get(groupKey);
+        if (group) {
+          group.threads.push(...projectThreads);
+        } else {
+          groups.set(groupKey, {
+            project,
+            title: logicalGroup?.displayName ?? project.title,
+            threads: projectThreads,
+          });
+        }
       }
     }
-    return groups;
-  }, [archivedSnapshots, scope]);
+    const sortedGroups = Array.from(groups, ([key, group]) => ({
+      ...group,
+      key,
+      threads: group.threads.toSorted((left, right) => {
+        const leftKey = left.archivedAt ?? left.createdAt;
+        const rightKey = right.archivedAt ?? right.createdAt;
+        return rightKey.localeCompare(leftKey) || right.id.localeCompare(left.id);
+      }),
+    }));
+    return { groups: sortedGroups, hasMultipleEnvironments };
+  }, [archivedSnapshots, environments, projectGroups, scope]);
 
   const handleArchivedThreadContextMenu = useCallback(
     async (threadRef: ScopedThreadRef, position: { x: number; y: number }) => {
@@ -3548,16 +3617,16 @@ export function ArchivedThreadsPanel() {
           />
         </SettingsSection>
       ) : (
-        archivedGroups.map(({ project, threads: projectThreads }, index) => (
+        archivedGroups.map(({ key, project, title, threads: projectThreads }, index) => (
           <SettingsSection
-            key={`${project.environmentId}:${project.id}`}
+            key={key}
             id={index === 0 ? searchableSetting("archive").id : undefined}
-            title={project.title}
+            title={title}
             icon={<ProjectFavicon project={project} />}
           >
             {projectThreads.map((thread) => (
               <SettingsRow
-                key={thread.id}
+                key={`${thread.environmentId}:${thread.id}`}
                 onContextMenu={(event) => {
                   event.preventDefault();
                   void (async () => {
@@ -3585,11 +3654,12 @@ export function ArchivedThreadsPanel() {
                 }}
                 title={thread.title}
                 description={
-                  <>
+                  <span className={hasMultipleEnvironments ? "block truncate" : undefined}>
+                    {hasMultipleEnvironments ? `${thread.environmentLabel} · ` : null}
                     Archived {formatRelativeTimeLabel(thread.archivedAt ?? thread.createdAt)}
                     {" \u00b7 Created "}
                     {formatRelativeTimeLabel(thread.createdAt)}
-                  </>
+                  </span>
                 }
                 control={
                   <Button

@@ -22,7 +22,6 @@ import {
   readEnvironmentFromLoginShell,
   readEnvironmentFromWindowsShell,
   readPathFromLaunchctl,
-  readPathFromLoginShell,
   resolveCommandPath,
   resolveKnownWindowsCliDirs,
   resolveSpawnCommand,
@@ -57,7 +56,7 @@ const recordCommandTrace = Effect.fnUntraced(function* <A, E, R>(effect: Effect.
   return { result, spans };
 });
 
-describe("readPathFromLoginShell", () => {
+describe("readEnvironmentFromLoginShell probe", () => {
   it("uses a shell-agnostic printenv PATH probe", () => {
     const execFile = vi.fn<
       (
@@ -67,7 +66,9 @@ describe("readPathFromLoginShell", () => {
       ) => string
     >(() => "__T3CODE_ENV_PATH_START__\n/a:/b\n__T3CODE_ENV_PATH_END__\n");
 
-    expect(readPathFromLoginShell("/opt/homebrew/bin/fish", execFile)).toBe("/a:/b");
+    expect(readEnvironmentFromLoginShell("/opt/homebrew/bin/fish", ["PATH"], execFile).PATH).toBe(
+      "/a:/b",
+    );
     expect(execFile).toHaveBeenCalledTimes(1);
 
     const firstCall = execFile.mock.calls[0] as
@@ -680,11 +681,19 @@ effectIt.layer(NodeServices.layer)("resolveSpawnCommand", (it) => {
     }),
   );
 
-  it.effect("escapes the executable and arguments for Windows command shims", () =>
+  it.effect("builds one escaped cmd.exe line for Windows command shims", () =>
     Effect.gen(function* () {
       const command = yield* resolveSpawnCommand(
         "vp",
-        ["run", "value & calc", "%PATH%", 'quote"value'],
+        [
+          "run",
+          "value & calc",
+          "%PATH%",
+          'quote"value',
+          "C:\\dir with space\\",
+          'slash\\"quote',
+          "x|y<z>^",
+        ],
         { env: { PATH: "", PATHEXT: ".COM;.EXE;.BAT;.CMD" } },
       ).pipe(
         Effect.provideService(HostProcess.Platform, "win32"),
@@ -695,15 +704,21 @@ effectIt.layer(NodeServices.layer)("resolveSpawnCommand", (it) => {
         ),
       );
 
-      expect(command.shell).toBe(true);
-      expect(command.command).not.toContain(" & ");
-      expect(command.command).toContain("^&");
-      expect(command.args).toEqual([
-        '^"run^"',
-        '^"value^ ^&^ calc^"',
-        '^"^%PATH^%^"',
-        '^"quote\\^"value^"',
-      ]);
+      // No args alongside `shell: true`: Node prints DEP0190 for that pairing.
+      expect(command).toEqual({
+        command: [
+          String.raw`^"C:\Program^ Files\npm^ ^&^ tools\vp.cmd^"`,
+          String.raw`^"run^"`,
+          String.raw`^"value^ ^&^ calc^"`,
+          String.raw`^"^%PATH^%^"`,
+          String.raw`^"quote\^"value^"`,
+          String.raw`^"C:\dir^ with^ space\\^"`,
+          String.raw`^"slash\\\^"quote^"`,
+          String.raw`^"x^|y^<z^>^^^"`,
+        ].join(" "),
+        args: [],
+        shell: true,
+      });
     }),
   );
 
@@ -862,6 +877,29 @@ effectIt.layer(NodeServices.layer)("resolveWindowsEnvironment", (it) => {
         expect.objectContaining({ env: expect.any(Object) }),
       );
     }),
+  );
+
+  it.effect(
+    "probes node with one PATH key when inherited environment records have mixed casing",
+    () =>
+      Effect.gen(function* () {
+        const probedEnvironments: Array<NodeJS.ProcessEnv | undefined> = [];
+
+        yield* withWindowsEnvironmentMocks(
+          resolveWindowsEnvironment({ Path: "C:\\Stale", PATH: "C:\\Windows\\System32" }),
+          () => ({ PATH: "C:\\Shell\\Bin" }),
+          (_command, options) =>
+            Effect.sync(() => {
+              probedEnvironments.push(options?.env);
+              return true;
+            }),
+        );
+
+        const pathEntries = Object.entries(probedEnvironments[0] ?? {}).filter(
+          ([key]) => key.toUpperCase() === "PATH",
+        );
+        expect(pathEntries).toEqual([["PATH", "C:\\Shell\\Bin;C:\\Windows\\System32"]]);
+      }),
   );
 
   it.effect("loads the PowerShell profile when baseline env cannot resolve node", () =>
