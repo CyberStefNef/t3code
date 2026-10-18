@@ -1,6 +1,16 @@
-import { describe, expect, it } from "vite-plus/test";
+import type { BrowserLinkTarget } from "@t3tools/contracts";
+import { describe, expect, it, vi } from "vite-plus/test";
 
-import { resolveLinkTarget } from "./browserLinkTarget";
+import { ensureClientSettingsHydrated } from "~/hooks/useSettings";
+
+import { resolveBrowserLinkTargetPreference, resolveLinkTarget } from "./browserLinkTarget";
+
+const settings = vi.hoisted(() => ({ browserLinkTarget: "system" as BrowserLinkTarget }));
+
+vi.mock("~/hooks/useSettings", () => ({
+  ensureClientSettingsHydrated: vi.fn(async () => undefined),
+  getClientSettings: () => settings,
+}));
 
 const click = { metaKey: false, ctrlKey: false };
 
@@ -28,8 +38,6 @@ describe("resolveLinkTarget", () => {
   });
 
   it("falls back to the system browser where there is no in-app browser", () => {
-    // The hosted web app and mobile have nowhere to open a tab, so the
-    // preference cannot be honoured there and the link still has to open.
     expect(
       resolveLinkTarget({
         url: "https://example.com/",
@@ -57,6 +65,14 @@ describe("resolveLinkTarget", () => {
         canOpenInApp: true,
       }),
     ).toBe("system");
+    expect(
+      resolveLinkTarget({
+        url: "https://example.com/",
+        event: { metaKey: false, ctrlKey: false, button: 1 },
+        preference: "app",
+        canOpenInApp: true,
+      }),
+    ).toBe("system");
   });
 
   it("leaves non-web schemes to the shell", () => {
@@ -66,4 +82,18 @@ describe("resolveLinkTarget", () => {
       );
     }
   });
+});
+
+describe("resolveBrowserLinkTargetPreference", () => {
+  it.each(["system", "app"] as const)(
+    "rejects failed reads instead of using the current %s preference",
+    async (preference) => {
+      settings.browserLinkTarget = preference;
+      const failure = new Error("Settings read failed");
+      vi.mocked(ensureClientSettingsHydrated).mockRejectedValueOnce(failure);
+
+      await expect(resolveBrowserLinkTargetPreference()).rejects.toBe(failure);
+      await expect(resolveBrowserLinkTargetPreference()).resolves.toBe(preference);
+    },
+  );
 });

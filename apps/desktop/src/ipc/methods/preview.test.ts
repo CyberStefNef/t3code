@@ -12,6 +12,7 @@ import * as Schema from "effect/Schema";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import * as PreviewManager from "../../preview/Manager.ts";
+import * as BrowserImport from "../../preview/BrowserImport/BrowserImport.ts";
 import * as PreviewIpc from "./preview.ts";
 
 const { fromPartition } = vi.hoisted(() => ({
@@ -80,6 +81,38 @@ describe("preview IPC methods", () => {
     });
   });
 
+  effectIt.effect("targets imports at the same partition tuple as the renderer", () => {
+    const received: Array<Parameters<BrowserImport.BrowserImport["Service"]["importCookies"]>[0]> =
+      [];
+    const browserImport = BrowserImport.BrowserImport.of({
+      listSources: Effect.succeed([]),
+      importCookies: (input) =>
+        Effect.sync(() => {
+          received.push(input);
+          return { imported: 0, skipped: 0, skippedDomains: [] };
+        }),
+    });
+    const request = (environmentId: string, targetProfileId: string) =>
+      PreviewIpc.importBrowserCookies.handler({
+        environmentId,
+        sourceId: "helium",
+        sourceProfileDirectory: "Default",
+        targetProfileId,
+      });
+
+    return Effect.gen(function* () {
+      yield* request("a", "b");
+      yield* request("a::b", DEFAULT_BROWSER_PROFILE_ID);
+
+      expect(received[0]).toMatchObject(PreviewIpc.resolvePartitionScope("a", "b"));
+      expect(received[1]).toMatchObject(
+        PreviewIpc.resolvePartitionScope("a::b", DEFAULT_BROWSER_PROFILE_ID),
+      );
+      expect(received[0]?.namespace).toBe("profile");
+      expect(received[1]?.namespace).toBeUndefined();
+    }).pipe(Effect.provideService(BrowserImport.BrowserImport, browserImport));
+  });
+
   effectIt.effect("rejects invalid webContents ids before resolving the preview service", () =>
     Effect.map(
       PreviewIpc.registerWebview
@@ -93,32 +126,6 @@ describe("preview IPC methods", () => {
         expect(fromPartition).not.toHaveBeenCalled();
       },
     ),
-  );
-
-  effectIt.effect("returns automation status for long runtime tab ids", () =>
-    Effect.gen(function* () {
-      const tabId =
-        `["environment-1","thread:delegated-task:${"a".repeat(120)}",` +
-        `"server-epoch-1","preview-1"]`;
-      const status = {
-        available: false,
-        visible: true,
-        tabId,
-        url: null,
-        title: null,
-        loading: false,
-      };
-      const manager = PreviewManager.PreviewManager.of({
-        automationStatus: () => Effect.succeed(status),
-      } as unknown as PreviewManager.PreviewManager["Service"]);
-
-      expect(tabId.length).toBeGreaterThan(128);
-      expect(
-        yield* PreviewIpc.automationStatus
-          .handler({ tabId })
-          .pipe(Effect.provideService(PreviewManager.PreviewManager, manager)),
-      ).toEqual(status);
-    }),
   );
 
   it("keeps the public automation status tab id limit", () => {

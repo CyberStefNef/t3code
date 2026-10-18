@@ -1,8 +1,24 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { resolveMarkdownLinkPresentation } from "@t3tools/mobile-markdown-text/links";
+import { resolveMarkdownLinkIcon, resolveMarkdownLinkPresentation } from "./markdownLinks";
+
+describe("resolveMarkdownLinkIcon", () => {
+  it("gives GitHub hosts the brand mark and everything else the generic glyph", () => {
+    expect(resolveMarkdownLinkIcon("github.com")).toBe("github");
+    expect(resolveMarkdownLinkIcon("GitHub.com")).toBe("github");
+    expect(resolveMarkdownLinkIcon("gist.github.com")).toBe("github");
+    expect(resolveMarkdownLinkIcon("github.community")).toBeNull();
+    expect(resolveMarkdownLinkIcon("notgithub.com")).toBeNull();
+    expect(resolveMarkdownLinkIcon("example.com")).toBeNull();
+  });
+});
 
 describe("resolveMarkdownLinkPresentation", () => {
+  it("keeps thread-link hrefs for in-app navigation", () => {
+    const href = "t3-thread://v1/thread-1";
+    expect(resolveMarkdownLinkPresentation(href)).toEqual({ kind: "link", href });
+  });
+
   it("treats protocol-relative media as an external URL, not a filesystem path", () => {
     expect(resolveMarkdownLinkPresentation("//cdn.example.com/clip.mp4?sig=a%2fb#t=2")).toEqual({
       kind: "external",
@@ -61,7 +77,7 @@ describe("resolveMarkdownLinkPresentation", () => {
     expect(resolveMarkdownLinkPresentation("package.json")).toEqual({
       kind: "file",
       href: "package.json",
-      icon: "package",
+      icon: "npm",
       label: "package.json",
       path: "package.json",
     });

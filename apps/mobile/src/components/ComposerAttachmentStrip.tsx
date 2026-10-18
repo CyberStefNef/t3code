@@ -1,13 +1,23 @@
-import { SymbolView } from "../components/AppSymbol";
+import { FilePreviewGallery, useFilePreviewGallery } from "./FilePreviewGallery";
+import { composerImageGallery } from "../lib/composerImageGallery";
+import { SymbolView } from "./ui/AppSymbol";
+import { imageMimeType } from "@t3tools/shared/image";
 import { videoMimeType } from "@t3tools/shared/video";
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Image, Pressable, ScrollView, View } from "react-native";
 
-import { AppText as Text } from "./AppText";
-import type { DraftComposerAttachment, DraftComposerFileAttachment } from "../lib/composerImages";
+import { AppText as Text } from "./ui/AppText";
+import { PierreEntryIcon } from "./PierreEntryIcon";
+import {
+  isFileBackedComposerAttachment,
+  type DraftComposerAttachment,
+  type DraftComposerFileAttachment,
+  type DraftComposerImageAttachment,
+} from "../lib/composerImages";
+import { resolveOwnedComposerAttachmentFileUri } from "../lib/composerAttachmentFiles";
 import { VideoAttachmentTile } from "./VideoAttachmentTile";
-import type { MediaActionsSource } from "../lib/mediaActions";
-import { PresentationSource } from "./NativePresentation";
+import { type MediaActionsSource } from "../lib/mediaActionsSource";
+import { PresentationSource } from "./ui/NativePresentation";
 import type { FilePreviewSource } from "./FilePreviewModal";
 import { isPdfFile } from "../lib/filePreview";
 import type { EnvironmentId } from "@t3tools/contracts";
@@ -18,21 +28,16 @@ import {
 
 export interface ComposerAttachmentStripProps {
   readonly environmentId?: EnvironmentId;
-  /** Attachments to display. */
   readonly attachments: ReadonlyArray<DraftComposerAttachment>;
-  /** Called when the user removes an attachment. */
   readonly onRemove: (imageId: string) => void;
-  /** Called when the user taps an image or PDF to preview it. */
   readonly onPressPreview?: (source: FilePreviewSource) => void;
   readonly onPressVideo?: (
     attachment: DraftComposerFileAttachment,
     sourceIdentifier: string,
   ) => void;
-  /** Image thumbnail size in points.  Defaults to 72. */
+  readonly onPressDocument?: (attachment: DraftComposerFileAttachment) => void;
   readonly imageSize?: number;
-  /** Border radius of each image thumbnail.  Defaults to 16. */
   readonly imageBorderRadius?: number;
-  /** Whether the remove button should sit in its own gutter instead of overlapping the image. */
   readonly removeButtonPlacement?: "overlay" | "gutter";
 }
 
@@ -47,6 +52,7 @@ type ComposerAttachmentThumbnailProps = {
     attachment: DraftComposerFileAttachment,
     sourceIdentifier: string,
   ) => void;
+  readonly onPressDocument?: (attachment: DraftComposerFileAttachment) => void;
 };
 
 export function ComposerAttachmentThumbnail(props: ComposerAttachmentThumbnailProps) {
@@ -87,34 +93,130 @@ export function ComposerAttachmentThumbnail(props: ComposerAttachmentThumbnailPr
   );
 }
 
+const PREVIEW_CACHE_DIRECTORY = "t3-composer-previews";
+
+/**
+ * Fabric re-parses an image source URL on every layout pass of the node, and a
+ * multi-megabyte data URL makes each Fabric commit slow enough that concurrent
+ * UI-thread commits (the question card's coverage animation) win the race every
+ * time until the renderer aborts.
+ */
+const INLINE_PREVIEW_FALLBACK_MAX_CHARS = 256_000;
+
+async function materializeDataUrlPreview(id: string, dataUrl: string): Promise<string | null> {
+  const comma = dataUrl.indexOf(",");
+  if (comma < 0) return null;
+  const { Directory, File, Paths } = await import("expo-file-system");
+  const mimeType = /^data:([^;,]+)/.exec(dataUrl)?.[1] ?? "image/jpeg";
+  const extension = (mimeType.split("/")[1] ?? "jpg").replace("jpeg", "jpg");
+  const directory = new Directory(Paths.cache, PREVIEW_CACHE_DIRECTORY);
+  directory.create({ idempotent: true, intermediates: true });
+  const file = new File(directory, `${id}.${extension}`);
+  if (!file.exists) {
+    file.create();
+    await file.write(dataUrl.slice(comma + 1), { encoding: "base64" });
+  }
+  return file.uri;
+}
+
+function useComposerImagePreviewUri(attachment: DraftComposerImageAttachment): string | null {
+  const { id, fileUri, previewUri } = attachment;
+  const [rebased, setRebased] = useState<{ fileUri: string; uri: string } | null>(null);
+  const [materialized, setMaterialized] = useState<{ id: string; uri: string | null } | null>(null);
+  const inlinePreview = fileUri === undefined && previewUri.startsWith("data:");
+  useEffect(() => {
+    if (fileUri === undefined) return;
+    let cancelled = false;
+    void (async () => {
+      const { Paths } = await import("expo-file-system");
+      const owned = resolveOwnedComposerAttachmentFileUri(fileUri, Paths.document.uri);
+      if (!cancelled && owned !== null && owned !== previewUri) setRebased({ fileUri, uri: owned });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [fileUri, previewUri]);
+  useEffect(() => {
+    if (!inlinePreview) return;
+    let cancelled = false;
+    void materializeDataUrlPreview(id, previewUri)
+      .then((uri) => {
+        if (!cancelled && uri !== null) setMaterialized({ id, uri });
+      })
+      .catch((error: unknown) => {
+        console.warn("[composer-attachments] could not cache an image preview", error);
+        if (!cancelled) setMaterialized({ id, uri: null });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, inlinePreview, previewUri]);
+  if (fileUri !== undefined && rebased?.fileUri === fileUri) return rebased.uri;
+  if (fileUri !== undefined) return previewUri.startsWith("data:") ? fileUri : previewUri;
+  if (inlinePreview) {
+    if (materialized?.id !== id) return null;
+    return (
+      materialized.uri ??
+      (previewUri.length <= INLINE_PREVIEW_FALLBACK_MAX_CHARS ? previewUri : null)
+    );
+  }
+  return previewUri;
+}
+
+function ComposerImageAttachment(
+  props: ComposerAttachmentThumbnailProps & { readonly attachment: DraftComposerImageAttachment },
+) {
+  const { attachment } = props;
+  const withGallery = useFilePreviewGallery();
+  const style = { width: props.size, height: props.size, borderRadius: props.borderRadius };
+  const previewUri = useComposerImagePreviewUri(attachment);
+  const sourceIdentifier = `draft-image:${attachment.id}`;
+  return (
+    <PresentationSource identifier={sourceIdentifier}>
+      <Pressable
+        accessibilityRole="imagebutton"
+        accessibilityLabel={`Open ${attachment.name}`}
+        disabled={!props.onPressPreview}
+        onPress={() =>
+          props.onPressPreview?.(
+            withGallery(
+              isFileBackedComposerAttachment(attachment)
+                ? { kind: "image", attachment, name: attachment.name, sourceIdentifier }
+                : {
+                    kind: "image",
+                    uri: attachment.dataUrl ?? attachment.previewUri,
+                    name: attachment.name,
+                    sourceIdentifier,
+                  },
+            ),
+          )
+        }
+      >
+        <Image
+          source={previewUri === null ? undefined : { uri: previewUri }}
+          style={style}
+          className="bg-subtle"
+          resizeMode="cover"
+        />
+      </Pressable>
+    </PresentationSource>
+  );
+}
+
 function ComposerAttachmentContent(props: ComposerAttachmentThumbnailProps) {
   const { attachment } = props;
-  const style = { width: props.size, height: props.size, borderRadius: props.borderRadius };
-  if (attachment.type === "image") {
-    const sourceIdentifier = `draft-image:${attachment.id}`;
+  // The document picker types every pick as a plain file, so a picture arrives here as one.
+  if (attachment.type === "image" || imageMimeType(attachment) !== null) {
+    const { source: _droppedSource, ...rest } = attachment;
     return (
-      <PresentationSource identifier={sourceIdentifier}>
-        <Pressable
-          accessibilityRole="imagebutton"
-          accessibilityLabel={`Open ${attachment.name}`}
-          disabled={!props.onPressPreview}
-          onPress={() =>
-            props.onPressPreview?.({
-              kind: "image",
-              uri: attachment.dataUrl,
-              name: attachment.name,
-              sourceIdentifier,
-            })
-          }
-        >
-          <Image
-            source={{ uri: attachment.previewUri }}
-            style={style}
-            className="bg-subtle"
-            resizeMode="cover"
-          />
-        </Pressable>
-      </PresentationSource>
+      <ComposerImageAttachment
+        {...props}
+        attachment={
+          attachment.type === "image"
+            ? attachment
+            : { ...rest, type: "image", previewUri: attachment.fileUri }
+        }
+      />
     );
   }
   const onPressVideo = props.onPressVideo;
@@ -123,42 +225,50 @@ function ComposerAttachmentContent(props: ComposerAttachmentThumbnailProps) {
       <ComposerVideoAttachment {...props} attachment={attachment} onPressVideo={onPressVideo} />
     );
   }
+  return <ComposerFileAttachment {...props} attachment={attachment} />;
+}
+
+function ComposerFileAttachment(
+  props: ComposerAttachmentThumbnailProps & { readonly attachment: DraftComposerFileAttachment },
+) {
+  const { attachment } = props;
+  const style = { width: props.size, height: props.size, borderRadius: props.borderRadius };
   const canPreview = isPdfFile(attachment) && props.onPressPreview !== undefined;
   const sourceIdentifier = `draft-file:${attachment.id}`;
+  const onPressDocument = props.onPressDocument;
   return (
-    <PresentationSource identifier={sourceIdentifier}>
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={`Open ${attachment.name}`}
-        disabled={!canPreview}
-        onPress={() =>
-          props.onPressPreview?.({
-            kind: "pdf",
-            name: attachment.name,
-            attachment,
-            sourceIdentifier,
-          })
-        }
-        className={
-          props.compact
-            ? "items-center justify-center bg-subtle"
-            : "items-center justify-center gap-1 bg-subtle px-2"
-        }
-        style={style}
-      >
-        <SymbolView
-          name="doc.text"
-          size={props.compact ? 15 : 22}
-          tintColor="#a3a3a3"
-          type="monochrome"
-        />
-        {!props.compact ? (
-          <Text className="w-full text-center text-2xs text-foreground" numberOfLines={1}>
-            {attachment.name}
-          </Text>
-        ) : null}
-      </Pressable>
-    </PresentationSource>
+    <>
+      <PresentationSource identifier={sourceIdentifier}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Open ${attachment.name}`}
+          disabled={!canPreview && onPressDocument === undefined}
+          onPress={() =>
+            canPreview
+              ? props.onPressPreview?.({
+                  kind: "pdf",
+                  name: attachment.name,
+                  attachment,
+                  sourceIdentifier,
+                })
+              : onPressDocument?.(attachment)
+          }
+          className={
+            props.compact
+              ? "items-center justify-center bg-subtle"
+              : "items-center justify-center gap-1 bg-subtle px-2"
+          }
+          style={style}
+        >
+          <PierreEntryIcon path={attachment.name} kind="file" size={props.compact ? 15 : 22} />
+          {!props.compact ? (
+            <Text className="w-full text-center text-2xs text-foreground" numberOfLines={1}>
+              {attachment.name}
+            </Text>
+          ) : null}
+        </Pressable>
+      </PresentationSource>
+    </>
   );
 }
 
@@ -198,10 +308,8 @@ function ComposerVideoAttachment(props: {
   );
 }
 
-/**
- * Attachment thumbnails used by the thread composer and the new-task draft screen.
- */
 export function ComposerAttachmentStrip(props: ComposerAttachmentStripProps) {
+  const gallery = useMemo(() => composerImageGallery(props.attachments), [props.attachments]);
   const size = props.imageSize ?? 72;
   const radius = props.imageBorderRadius ?? 16;
   const removeButtonPlacement = props.removeButtonPlacement ?? "overlay";
@@ -212,50 +320,53 @@ export function ComposerAttachmentStrip(props: ComposerAttachmentStripProps) {
   }
 
   return (
-    <ScrollView
-      horizontal
-      showsHorizontalScrollIndicator={false}
-      keyboardShouldPersistTaps="always"
-      className="grow-0"
-    >
-      <View className="flex-row gap-2.5">
-        {props.attachments.map((attachment) => (
-          <View
-            key={attachment.id}
-            className="relative"
-            style={{
-              paddingTop: removeButtonGutter,
-              paddingRight: removeButtonGutter,
-            }}
-          >
-            <ComposerAttachmentThumbnail
-              environmentId={props.environmentId}
-              attachment={attachment}
-              size={size}
-              borderRadius={radius}
-              onPressPreview={props.onPressPreview}
-              onPressVideo={props.onPressVideo}
-            />
-            <Pressable
-              className="absolute h-[22px] w-[22px] items-center justify-center rounded-[11px] bg-black/55"
+    <FilePreviewGallery value={gallery}>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        keyboardShouldPersistTaps="always"
+        className="grow-0"
+      >
+        <View className="flex-row gap-2.5">
+          {props.attachments.map((attachment) => (
+            <View
+              key={attachment.id}
+              className="relative"
               style={{
-                top: removeButtonPlacement === "gutter" ? 0 : 4,
-                right: removeButtonPlacement === "gutter" ? 0 : 4,
+                paddingTop: removeButtonGutter,
+                paddingRight: removeButtonGutter,
               }}
-              hitSlop={6}
-              onPress={() => props.onRemove(attachment.id)}
             >
-              <SymbolView
-                name="xmark"
-                size={9}
-                tintColor="#ffffff"
-                type="monochrome"
-                weight="bold"
+              <ComposerAttachmentThumbnail
+                environmentId={props.environmentId}
+                attachment={attachment}
+                size={size}
+                borderRadius={radius}
+                onPressPreview={props.onPressPreview}
+                onPressVideo={props.onPressVideo}
+                onPressDocument={props.onPressDocument}
               />
-            </Pressable>
-          </View>
-        ))}
-      </View>
-    </ScrollView>
+              <Pressable
+                className="absolute h-[22px] w-[22px] items-center justify-center rounded-[11px] bg-black/55"
+                style={{
+                  top: removeButtonPlacement === "gutter" ? 0 : 4,
+                  right: removeButtonPlacement === "gutter" ? 0 : 4,
+                }}
+                hitSlop={6}
+                onPress={() => props.onRemove(attachment.id)}
+              >
+                <SymbolView
+                  name="xmark"
+                  size={9}
+                  tintColor="#ffffff"
+                  type="monochrome"
+                  weight="bold"
+                />
+              </Pressable>
+            </View>
+          ))}
+        </View>
+      </ScrollView>
+    </FilePreviewGallery>
   );
 }

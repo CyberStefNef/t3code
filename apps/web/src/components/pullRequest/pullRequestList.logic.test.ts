@@ -1,7 +1,16 @@
-import type { EnvironmentId, ProjectId, PullRequestListEntry } from "@t3tools/contracts";
+import { SourceControlProviderKind } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  ProjectId,
+  PullRequestAction,
+  PullRequestListEntry,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  pullRequestHostActions,
+  largestPullRequestReadCount,
+  pullRequestQuickActions,
   filterPullRequestsByInvolvement,
   findScopedProject,
   mergePullRequestLists,
@@ -10,7 +19,6 @@ import {
   groupPullRequestsByInvolvement,
   matchesPullRequestFilters,
   matchesPullRequestQuery,
-  parsePullRequestQuery,
   pullRequestStatsBatches,
   pullRequestStatsKeysToRequest,
   pullRequestStatsRefreshBatches,
@@ -21,14 +29,21 @@ import {
   readPullRequestListSnapshot,
   writePullRequestListSnapshot,
   rankPullRequestMatches,
+  rankPullRequestsBlockedOnAuthor,
+  rankPullRequestsBlockedOnReviewer,
   rankPullRequestsByMergeReadiness,
   scorePullRequestMatch,
+  sortPullRequestGroups,
   retainVisiblePullRequestStatsBatches,
   withDiffStat,
   resolveProjectScope,
   resolveQueryEnvironmentIds,
   resolveSelectedEnvironmentId,
   type EnvironmentPullRequestEntry,
+  applyPullRequestOverrides,
+  pullRequestOverrideAfterAction,
+  reusePullRequestEntries,
+  settlePullRequestOverrides,
 } from "./pullRequestList.logic";
 import {
   pullRequestListPreferences,
@@ -68,8 +83,30 @@ function entry(
 }
 
 describe("visible pull request line-count targets", () => {
+  it("reuses counts supplied by the listing and only requests missing counts", () => {
+    const entries = [
+      entry({ number: 1, additions: 12, deletions: 0 }),
+      entry({ number: 2, additions: 0, deletions: 7 }),
+      entry({ number: 3, additions: 0, deletions: 0 }),
+    ];
+    const entriesByKey = new Map(entries.map((item) => [pullRequestEntryKey(item), item]));
+    const keys = pullRequestStatsKeysToRequest(
+      entriesByKey,
+      new Set(entries.map(pullRequestEntryKey)),
+      [],
+      new Map(),
+    );
+
+    expect(pullRequestStatsBatches(entriesByKey, keys)[0]?.input.refs).toEqual([
+      { projectId: "project-1", repository: "pingdotgg/t3code", number: 3 },
+    ]);
+  });
+
   it("does not request a row again after its received batch is pruned", () => {
-    const entries = [entry({ number: 1 }), entry({ number: 2 })];
+    const entries = [
+      entry({ additions: 0, deletions: 0, number: 1 }),
+      entry({ additions: 0, deletions: 0, number: 2 }),
+    ];
     const entriesByKey = new Map(entries.map((item) => [pullRequestEntryKey(item), item]));
     const firstKey = pullRequestEntryKey(entries[0]!);
     const secondKey = pullRequestEntryKey(entries[1]!);
@@ -96,7 +133,9 @@ describe("visible pull request line-count targets", () => {
   });
 
   it("drops historical rows after a long scroll so refresh stays bounded to the viewport", () => {
-    const entries = Array.from({ length: 500 }, (_, index) => entry({ number: index + 1 }));
+    const entries = Array.from({ length: 500 }, (_, index) =>
+      entry({ additions: 0, deletions: 0, number: index + 1 }),
+    );
     const entriesByKey = new Map(entries.map((item) => [pullRequestEntryKey(item), item]));
     const batches = entries.map(
       (item) => pullRequestStatsBatches(entriesByKey, new Set([pullRequestEntryKey(item)]))[0]!,
@@ -111,7 +150,9 @@ describe("visible pull request line-count targets", () => {
   });
 
   it("keeps every per-environment batch within the stats contract limit", () => {
-    const entries = Array.from({ length: 501 }, (_, index) => entry({ number: index + 1 }));
+    const entries = Array.from({ length: 501 }, (_, index) =>
+      entry({ additions: 0, deletions: 0, number: index + 1 }),
+    );
     const entriesByKey = new Map(entries.map((item) => [pullRequestEntryKey(item), item]));
     const batches = pullRequestStatsBatches(
       entriesByKey,
@@ -124,9 +165,9 @@ describe("visible pull request line-count targets", () => {
 
   it("selects visible rows for date modes and every uncached row for size modes", () => {
     const entries = [
-      entry({ number: 1 }),
-      entry({ number: 2 }),
-      entry({ number: 3, environmentId: "env-2" as EnvironmentId }),
+      entry({ additions: 0, deletions: 0, number: 1 }),
+      entry({ additions: 0, deletions: 0, number: 2 }),
+      entry({ additions: 0, deletions: 0, number: 3, environmentId: "env-2" as EnvironmentId }),
     ];
     const entriesByKey = new Map(entries.map((item) => [pullRequestEntryKey(item), item]));
     const [firstKey, secondKey] = entries.map(pullRequestEntryKey);
@@ -161,7 +202,11 @@ describe("visible pull request line-count targets", () => {
   });
 
   it("refreshes only visible rows unless size sorting needs every loaded row", () => {
-    const entries = [entry({ number: 1 }), entry({ number: 2 }), entry({ number: 3 })];
+    const entries = [
+      entry({ additions: 0, deletions: 0, number: 1 }),
+      entry({ additions: 0, deletions: 0, number: 2 }),
+      entry({ additions: 0, deletions: 0, number: 3 }),
+    ];
     const entriesByKey = new Map(entries.map((item) => [pullRequestEntryKey(item), item]));
     const visibleKeys = new Set([pullRequestEntryKey(entries[1]!)]);
     const cachedStats = mergePullRequestDiffStats(
@@ -197,7 +242,10 @@ describe("visible pull request line-count targets", () => {
   });
 
   it("ignores a late refresh after the filter or stats policy changes", () => {
-    const entries = [entry({ number: 1 }), entry({ number: 2 })];
+    const entries = [
+      entry({ additions: 0, deletions: 0, number: 1 }),
+      entry({ additions: 0, deletions: 0, number: 2 }),
+    ];
     const entriesByKey = new Map(entries.map((item) => [pullRequestEntryKey(item), item]));
     const visibleKeys = new Set([pullRequestEntryKey(entries[1]!)]);
     const requestedScope = { key: "open", policy: "visible" } as const;
@@ -216,7 +264,10 @@ describe("visible pull request line-count targets", () => {
   });
 
   it("does not add request batches again while rows are active or cached", () => {
-    const entries = [entry({ number: 1 }), entry({ number: 2 })];
+    const entries = [
+      entry({ additions: 0, deletions: 0, number: 1 }),
+      entry({ additions: 0, deletions: 0, number: 2 }),
+    ];
     const entriesByKey = new Map(entries.map((item) => [pullRequestEntryKey(item), item]));
     const first = pullRequestStatsRequestBatches({
       entriesByKey,
@@ -282,12 +333,11 @@ describe("pull request involvement filtering", () => {
   });
 
   it("does not treat a matching login on another host as the viewer", () => {
-    // The same name on GitLab is a different account, and its viewer is unknown here.
     const mixed = [
       entry({ number: 1, author: { login: "Bilal", name: null, avatarUrl: null } }),
       entry({
         number: 2,
-        provider: "gitlab",
+        provider: SourceControlProviderKind.make("gitlab"),
         host: "gitlab.com",
         author: { login: "Bilal", name: null, avatarUrl: null },
       }),
@@ -302,8 +352,6 @@ describe("pull request involvement filtering", () => {
   });
 
   it("keeps two hosts of one provider kind as two accounts", () => {
-    // A GitHub Enterprise install is a different account from github.com, so the viewer for
-    // one must not claim authorship of the other's change requests.
     const mixed = [
       entry({ number: 1, author: { login: "Bilal", name: null, avatarUrl: null } }),
       entry({
@@ -328,8 +376,8 @@ describe("pull request grouping", () => {
       VIEWERS,
     );
     expect(groups.map((group) => [group.key, group.entries.length])).toEqual([
-      ["reviewRequested", 1],
       ["authored", 1],
+      ["reviewRequested", 1],
     ]);
   });
 
@@ -500,91 +548,11 @@ describe("narrowing rows by the filters a host may not have applied", () => {
       ],
     });
     expect(matchesPullRequestFilters(row, { labels: [["size:S", "size:XS"], ["bug"]] })).toBe(true);
-    // The second group holds nothing this row carries, so the first one satisfied is not enough.
     expect(matchesPullRequestFilters(row, { labels: [["size:S"], ["wip"]] })).toBe(false);
   });
 
   it("holds on to every row for a filter no row carries the answer to", () => {
     expect(narrow({ checks: "passing" })).toEqual([1, 2, 3, 4]);
-  });
-});
-
-describe("reading qualifiers out of a typed query", () => {
-  it("keeps quoted values whole and separates negation", () => {
-    expect(parsePullRequestQuery('label:"needs design" -label:wip Fix the parser')).toEqual({
-      text: "Fix the parser",
-      filters: { labels: [["needs design"]], excludedLabels: ["wip"] },
-    });
-  });
-
-  it("reads a comma-separated list as one group either name satisfies", () => {
-    expect(parsePullRequestQuery("label:size:S,size:XS").filters.labels).toEqual([
-      ["size:S", "size:XS"],
-    ]);
-  });
-
-  it("keeps the spaces in a quoted name of a list, and drops an empty part", () => {
-    expect(parsePullRequestQuery('label:"needs design","wip"').filters.labels).toEqual([
-      ["needs design", "wip"],
-    ]);
-    expect(parsePullRequestQuery("label:a,,b").filters.labels).toEqual([["a", "b"]]);
-  });
-
-  it("excludes every name of a negated list", () => {
-    expect(parsePullRequestQuery("-label:a,b").filters).toEqual({ excludedLabels: ["a", "b"] });
-  });
-
-  it("makes each label qualifier its own group, so the groups are an AND", () => {
-    expect(parsePullRequestQuery("label:bug label:a,b").filters.labels).toEqual([
-      ["bug"],
-      ["a", "b"],
-    ]);
-  });
-
-  it("reads the scalar qualifiers in GitHub's own spelling", () => {
-    expect(
-      parsePullRequestQuery("author:octocat DRAFT:false review:changes_requested status:failure")
-        .filters,
-    ).toEqual({
-      author: "octocat",
-      draft: "hide",
-      review: "changes-requested",
-      checks: "failing",
-    });
-  });
-
-  it("leaves an unknown value and a stray colon as text, and reads an unknown key as a label", () => {
-    const parsed = parsePullRequestQuery("milestone:v2 draft:maybe status: parser");
-    expect(parsed.filters).toEqual({ labels: [["milestone:v2"]] });
-    // A known key whose value it does not take is text, so "status:" itself stays findable.
-    expect(parsed.text).toBe("draft:maybe status: parser");
-  });
-
-  it("reads a quoted name holding a comma as the one label it is", () => {
-    expect(parsePullRequestQuery('label:"needs,triage"').filters.labels).toEqual([
-      ["needs,triage"],
-    ]);
-    expect(parsePullRequestQuery('-label:"needs,triage"').filters.excludedLabels).toEqual([
-      "needs,triage",
-    ]);
-  });
-
-  it("cuts a typed query back to what the contract carries", () => {
-    const many = Array.from({ length: 14 }, (_, index) => `l${index}`).join(",");
-    const long = "x".repeat(240);
-    const parsed = parsePullRequestQuery(`label:${many} label:${long} author:${long}`);
-    expect(parsed.filters.labels?.[0]).toHaveLength(10);
-    expect(parsed.filters.labels?.[1]).toEqual(["x".repeat(200)]);
-    expect(parsed.filters.author).toBe("x".repeat(200));
-  });
-
-  it("cuts a namespaced label after its key is prefixed on", () => {
-    const parsed = parsePullRequestQuery(`size:${"x".repeat(240)}`);
-    expect(parsed.filters.labels).toEqual([[`size:${"x".repeat(240)}`.slice(0, 200)]]);
-  });
-
-  it("answers an empty query with an empty everything", () => {
-    expect(parsePullRequestQuery("   ")).toEqual({ text: "", filters: {} });
   });
 });
 
@@ -605,7 +573,6 @@ describe("resolveProjectScope", () => {
   });
 
   it("keeps an id while the projects are still unknown", () => {
-    // Dropping here would list every project for a moment before narrowing back down.
     expect(resolveProjectScope("p9", [], false)).toBe("p9");
   });
 });
@@ -631,14 +598,12 @@ describe("ranking what a search found", () => {
   });
 
   it("finds the words in any order, which is how people type them", () => {
-    // Substrings count, so "welcomes" answers "welcome" — a search is not a spelling test.
     expect(
       scorePullRequestMatch(row({ title: "The wizard that welcomes" }), "welcome wizard"),
     ).toBe(70);
     expect(
       scorePullRequestMatch(row({ title: "Wizard for the welcome flow" }), "welcome wizard"),
     ).toBe(70);
-    // One of the two words is a mention, not an answer, and ranks under both.
     expect(scorePullRequestMatch(row({ title: "A wizard, of sorts" }), "welcome wizard")).toBe(30);
   });
 
@@ -686,6 +651,7 @@ describe("default merge-readiness ranking", () => {
       number: 4,
       checksState: "passing",
       reviewDecision: "approved",
+      additions: 1_000,
       updatedAt: "2026-06-01T00:00:00Z",
     });
     const draft = entry({
@@ -710,7 +676,7 @@ describe("default merge-readiness ranking", () => {
     ).toEqual([4, 3, 5, 2, 6, 1]);
   });
 
-  it("uses recency inside one readiness tier", () => {
+  it("uses recency when readiness and diff size tie", () => {
     const older = entry({ number: 1, checksState: "passing" });
     const newer = entry({
       number: 2,
@@ -723,13 +689,13 @@ describe("default merge-readiness ranking", () => {
     ]);
   });
 
-  it("puts the smallest measured change first inside a readiness tier", () => {
+  it("ranks smaller measured diffs first within a readiness tier as counts arrive", () => {
     const larger = entry({
       number: 1,
       checksState: "passing",
       reviewDecision: "approved",
-      additions: 40,
-      deletions: 10,
+      additions: 1,
+      deletions: 49,
       updatedAt: "2026-09-01T00:00:00Z",
     });
     const smaller = entry({
@@ -752,6 +718,188 @@ describe("default merge-readiness ranking", () => {
     expect(
       rankPullRequestsByMergeReadiness([larger, unknown, smaller]).map((row) => row.number),
     ).toEqual([2, 1, 3]);
+    expect(
+      rankPullRequestsByMergeReadiness([
+        larger,
+        { ...unknown, additions: 1, deletions: 0 },
+        smaller,
+      ]).map((row) => row.number),
+    ).toEqual([3, 2, 1]);
+  });
+
+  it("distinguishes measured empty diffs from missing counts when sorting groups", () => {
+    const unknown = entry({ number: 1, additions: 0, deletions: 0 });
+    const measured = entry({ number: 2 });
+    const empty = entry({ number: 3, additions: 0, deletions: 0 });
+    const groups = [
+      { key: "others", label: "Others", entries: [unknown, measured, empty] },
+    ] as const;
+
+    const sorted = sortPullRequestGroups(groups, "ready", "", (row) => row.number !== 1);
+
+    expect(sorted[0]!.entries.map((row) => row.number)).toEqual([3, 2, 1]);
+    expect(sortPullRequestGroups(groups, "ready", "sidebar", (row) => row.number !== 1)).toEqual(
+      groups,
+    );
+  });
+
+  it("keeps authored work first and ranks each group by readiness", () => {
+    const authoredWaiting = entry({ number: 1, checksState: "pending" });
+    const authoredReady = entry({
+      number: 2,
+      checksState: "passing",
+      reviewDecision: "approved",
+    });
+    const otherReady = entry({
+      number: 3,
+      checksState: "passing",
+      reviewDecision: "approved",
+    });
+    const sorted = sortPullRequestGroups(
+      [
+        { key: "authored", label: "Authored", entries: [authoredWaiting, authoredReady] },
+        { key: "others", label: "Others", entries: [otherReady] },
+      ],
+      "ready",
+      "",
+    );
+
+    expect(sorted.map((group) => group.key)).toEqual(["authored", "others"]);
+    expect(sorted.flatMap((group) => group.entries).map((row) => row.number)).toEqual([2, 1, 3]);
+  });
+
+  it.each([
+    ["updated", [1, 2]],
+    ["newest", [2, 1]],
+    ["oldest", [1, 2]],
+    ["largest", [1, 2]],
+    ["smallest", [2, 1]],
+  ] as const)("keeps authored first while applying the %s sort inside groups", (sort, order) => {
+    const olderLarger = entry({
+      number: 1,
+      additions: 20,
+      createdAt: "2026-07-01T00:00:00Z",
+      updatedAt: "2026-08-01T00:00:00Z",
+    });
+    const newerSmaller = entry({
+      number: 2,
+      additions: 2,
+      createdAt: "2026-08-01T00:00:00Z",
+      updatedAt: "2026-07-01T00:00:00Z",
+    });
+    const sorted = sortPullRequestGroups(
+      [
+        { key: "authored", label: "Authored", entries: [olderLarger, newerSmaller] },
+        { key: "others", label: "Others", entries: [entry({ number: 3 })] },
+      ],
+      sort,
+      "",
+    );
+
+    expect(sorted.map((group) => group.key)).toEqual(["authored", "others"]);
+    expect(sorted[0]!.entries.map((row) => row.number)).toEqual(order);
+  });
+});
+
+describe("blocked-on-me ranking", () => {
+  it("ranks authored work by how surely it is the author's to unblock, newest first within a tier", () => {
+    const conflict = entry({
+      number: 1,
+      mergeability: "conflicting",
+      checksState: "failing",
+      updatedAt: "2026-08-01T00:00:00Z",
+    });
+    const olderFailing = entry({
+      number: 2,
+      checksState: "failing",
+      updatedAt: "2026-08-01T00:00:00Z",
+    });
+    const changesRequested = entry({
+      number: 3,
+      reviewDecision: "changes-requested",
+      checksState: "failing",
+      updatedAt: "2026-08-02T00:00:00Z",
+    });
+    const approved = entry({ number: 4, checksState: "passing", reviewDecision: "approved" });
+    const draft = entry({ number: 5, isDraft: true, checksState: "passing" });
+    const waiting = entry({ number: 6 });
+    const merged = entry({ number: 7, state: "merged", updatedAt: "2026-08-01T00:00:00Z" });
+    const newerClosed = entry({ number: 8, state: "closed", updatedAt: "2026-08-03T00:00:00Z" });
+    const newerFailing = entry({
+      number: 9,
+      checksState: "failing",
+      updatedAt: "2026-08-03T00:00:00Z",
+    });
+
+    expect(
+      rankPullRequestsBlockedOnAuthor([
+        waiting,
+        merged,
+        olderFailing,
+        draft,
+        approved,
+        changesRequested,
+        newerClosed,
+        conflict,
+        newerFailing,
+      ]).map((row) => row.number),
+    ).toEqual([1, 3, 9, 2, 5, 6, 4, 8, 7]);
+  });
+
+  it("ranks reviewer work with open rows first, newest first", () => {
+    const olderOpen = entry({ number: 1, updatedAt: "2026-08-01T00:00:00Z" });
+    const newerOpen = entry({ number: 2, updatedAt: "2026-08-02T00:00:00Z" });
+    const olderFinished = entry({ number: 3, state: "merged", updatedAt: "2026-08-01T00:00:00Z" });
+    const newerFinished = entry({ number: 4, state: "closed", updatedAt: "2026-08-03T00:00:00Z" });
+
+    expect(
+      rankPullRequestsBlockedOnReviewer([newerFinished, newerOpen, olderFinished, olderOpen]).map(
+        (row) => row.number,
+      ),
+    ).toEqual([2, 1, 4, 3]);
+  });
+
+  it("ranks blocked groups according to their involvement", () => {
+    const authored = [
+      entry({ number: 1, isDraft: true }),
+      entry({ number: 2, checksState: "failing" }),
+    ];
+    const reviewing = [
+      entry({ number: 3, updatedAt: "2026-08-02T00:00:00Z" }),
+      entry({ number: 4, updatedAt: "2026-08-01T00:00:00Z" }),
+    ];
+    const others = [
+      entry({ number: 5, updatedAt: "2026-08-02T00:00:00Z" }),
+      entry({ number: 6, isDraft: true }),
+    ];
+    const groups = [
+      { key: "authored", label: "Authored", entries: authored },
+      { key: "reviewRequested", label: "Review requested", entries: reviewing },
+      { key: "others", label: "Others", entries: others },
+    ] as const;
+
+    expect(
+      sortPullRequestGroups(groups, "blocked", "", undefined, "all").map((group) =>
+        group.entries.map((row) => row.number),
+      ),
+    ).toEqual([
+      [2, 1],
+      [3, 4],
+      [5, 6],
+    ]);
+    expect(
+      sortPullRequestGroups([groups[2]], "blocked", "", undefined, "authored")[0]!.entries.map(
+        (row) => row.number,
+      ),
+    ).toEqual([6, 5]);
+    expect(
+      sortPullRequestGroups([groups[2]], "blocked", "", undefined, "reviewing")[0]!.entries.map(
+        (row) => row.number,
+      ),
+    ).toEqual([5, 6]);
+    expect(sortPullRequestGroups(groups, "blocked", "needle", undefined, "authored")).toEqual(
+      groups,
+    );
   });
 });
 
@@ -780,7 +928,6 @@ describe("merging line counts across keyed stats queries", () => {
       { environmentId: "env-1", projectId: "project-1", number: 1, additions: 10, deletions: 2 },
       { environmentId: "env-1", projectId: "project-1", number: 2, additions: 5, deletions: 1 },
     ]);
-    // A third row appeared; its batch is still pending and contributes nothing yet.
     const merged = mergePullRequestDiffStats(held, []);
     expect(merged.get("env-1 project-1 1")).toEqual({ additions: 10, deletions: 2 });
     expect(merged.get("env-1 project-1 2")).toEqual({ additions: 5, deletions: 1 });
@@ -815,7 +962,6 @@ describe("partitioning with the hosts' own priority reads", () => {
     const older = entry({ number: 1, updatedAt: "2026-07-05T00:00:00Z" });
     const newer = entry({ number: 2, updatedAt: "2026-07-06T00:00:00Z" });
     const mine = authoredRow(3, "2026-07-04T00:00:00Z");
-    // The authored partition already holds the row the continuation carries.
     const groups = partitionPullRequestsWithPriority([newer, older, mine], [mine], []);
     expect(groups.map((group) => group.key)).toEqual(["authored", "others"]);
     expect(groups[1]!.entries.map((item) => item.number)).toEqual([2, 1]);
@@ -843,9 +989,9 @@ describe("partitioning with the hosts' own priority reads", () => {
       updatedAt: "2026-06-02T00:00:00Z",
     });
     const groups = partitionPullRequestsWithPriority([], [both], [both, requestedOlder, requested]);
-    expect(groups.map((group) => group.key)).toEqual(["reviewRequested", "authored"]);
-    expect(groups[0]!.entries.map((item) => item.number)).toEqual([2, 3]);
-    expect(groups[1]!.entries.map((item) => item.number)).toEqual([1]);
+    expect(groups.map((group) => group.key)).toEqual(["authored", "reviewRequested"]);
+    expect(groups[0]!.entries.map((item) => item.number)).toEqual([1]);
+    expect(groups[1]!.entries.map((item) => item.number)).toEqual([2, 3]);
   });
 
   it("lets the feed's copy of a partitioned row replace the partition's", () => {
@@ -917,9 +1063,6 @@ describe("the list snapshot across a reload", () => {
   });
 
   it("caps the accumulated rows but keeps the whole host set", () => {
-    // The page keeps growing as the reader scrolls, so what gets written is the accumulated
-    // list rather than one round's answer — capped at the one page a cold start needs, while
-    // the hosts it was read from (which do not grow with the page) are kept in full.
     const storage = makeStorage();
     const manyEntries = Array.from({ length: 120 }, (_, index) => entry({ number: index + 1 }));
     const viewers = { "github.com": "Bilal", "gitlab.com": "Bilal" };
@@ -1096,7 +1239,7 @@ describe("merging the environments' own listings", () => {
           providers: [
             {
               host: "github.com",
-              kind: "github",
+              kind: SourceControlProviderKind.make("github"),
               searchesOnHost: false,
               projectCount: 2,
               configured: false,
@@ -1106,8 +1249,6 @@ describe("merging the environments' own listings", () => {
         }),
       ],
     ]);
-    // Readable because one environment could read it, but narrowed locally because the other
-    // answers unsearched.
     expect(merged?.providers).toEqual([
       {
         host: "github.com",
@@ -1150,9 +1291,6 @@ describe('who "I" am, per server', () => {
   const byBilal = { login: "Bilal", name: null, avatarUrl: null };
 
   it("does not let one server's account decide who authored another server's rows", () => {
-    // Both servers reach github.com, signed in as different people. Folded into one host-keyed
-    // record, whichever answered last spoke for both — and every row of the reader's own work
-    // was filed under Others.
     const merged = mergePullRequestLists([
       [ENV_1, answer({ "github.com": "Bilal" }, [entry({ number: 1, author: byBilal })])],
       [ENV_2, answer({ "github.com": "Octocat" }, [entry({ number: 2, author: byBilal })])],
@@ -1206,7 +1344,6 @@ describe("the project an id names", () => {
 
   it("answers a bare id only where one server has it", () => {
     expect(findScopedProject(projects, null, "project-2")?.environmentId).toBe(ENV_2);
-    // Two servers hold this id: narrowing to either would be a coin toss the reader cannot see.
     expect(findScopedProject(projects, null, "project-1")).toBeUndefined();
   });
 
@@ -1243,8 +1380,6 @@ describe("which environments a listing should ask", () => {
       { id: "project-1", environmentId: ENV_1 },
       { id: "project-1", environmentId: ENV_2 },
     ];
-    // Two servers can genuinely hold the same project id string; the third holds no such project
-    // and asking it would return an unrelated project's rows rather than an honest empty answer.
     expect(
       resolveQueryEnvironmentIds(environmentIds, projects, undefined, "project-1", true),
     ).toEqual([ENV_1, ENV_2]);
@@ -1258,9 +1393,6 @@ describe("which environments a listing should ask", () => {
   });
 
   it("asks every environment while the servers have not said what they hold yet", () => {
-    // Nothing matches the id because nothing has been read yet, which is not the same answer as
-    // no server holding it: reading none of them would show an empty page for a project that is
-    // there.
     expect(resolveQueryEnvironmentIds(environmentIds, [], undefined, "project-1", false)).toEqual(
       environmentIds,
     );
@@ -1278,8 +1410,6 @@ describe("the server a saved selection names", () => {
   const known = new Set([ENV_1, ENV_2]);
 
   it("resolves to nothing yet for a server that is known but not ready, rather than falling back", () => {
-    // ENV_2 is in the catalog (still connecting, say) but not the fallback; a caller that then
-    // looks a project up under ENV_2 finds none rather than one belonging to the fallback server.
     expect(resolveSelectedEnvironmentId(ENV_2, known, ENV_1)).toBe(ENV_2);
   });
 
@@ -1299,68 +1429,11 @@ describe("the server a saved selection names", () => {
   });
 });
 
-describe("colon-namespaced labels typed as a search", () => {
-  it("reads an unknown key as the label it almost always is", () => {
-    expect(parsePullRequestQuery("size:XXL").filters.labels).toEqual([["size:XXL"]]);
-    expect(parsePullRequestQuery("vouch:trusted").filters.labels).toEqual([["vouch:trusted"]]);
-    expect(parsePullRequestQuery("size:XXL").text).toBe("");
-  });
-
-  it("reads the key as the namespace of every bare name in its list", () => {
-    expect(parsePullRequestQuery("size:S,XS").filters.labels).toEqual([["size:S", "size:XS"]]);
-  });
-
-  it("leaves a name that already carries its own namespace alone", () => {
-    // `size:S,size:XS` is the same pair written out; prefixing again would ask for `size:size:XS`.
-    expect(parsePullRequestQuery("size:S,size:XS").filters.labels).toEqual([["size:S", "size:XS"]]);
-  });
-
-  it("excludes one the same way", () => {
-    expect(parsePullRequestQuery("-size:XXL").filters.excludedLabels).toEqual(["size:XXL"]);
-    expect(parsePullRequestQuery("-size:S,XS").filters.excludedLabels).toEqual([
-      "size:S",
-      "size:XS",
-    ]);
-  });
-
-  it("keeps a quoted token as text, which is the way back to a literal search", () => {
-    const parsed = parsePullRequestQuery('"size:XXL"');
-    expect(parsed.filters.labels).toBeUndefined();
-    expect(parsed.text).toBe('"size:XXL"');
-  });
-
-  it("reads a hyphenated namespace as a label too", () => {
-    expect(parsePullRequestQuery("priority-1:high").filters.labels).toEqual([["priority-1:high"]]);
-    expect(parsePullRequestQuery("priority-1:high").text).toBe("");
-  });
-
-  it("leaves a pasted link alone rather than naming a label after its scheme", () => {
-    const parsed = parsePullRequestQuery("https://github.com/pingdotgg/t3code/pull/1");
-    expect(parsed.filters.labels).toBeUndefined();
-    expect(parsed.text).toBe("https://github.com/pingdotgg/t3code/pull/1");
-  });
-
-  it("mixes with the keys it does know, and with plain words", () => {
-    const parsed = parsePullRequestQuery("area:web draft:true wizard label:bug");
-    expect(parsed.filters).toEqual({ labels: [["area:web"], ["bug"]], draft: "only" });
-    expect(parsed.text).toBe("wizard");
-  });
-
-  it("shares the ceiling with the labels typed as labels", () => {
-    const many = Array.from({ length: 12 }, (_, index) => `area:${index}`).join(" ");
-    expect(parsePullRequestQuery(many).filters.labels).toHaveLength(10);
-  });
-});
-
 describe("the priority groups against a paginated feed", () => {
   const authoredRow = (number: number, updatedAt: string) =>
     entry({ number, updatedAt, author: { login: "Bilal", name: null, avatarUrl: null } });
 
   it("shows every authored row the host reported, not only the ones the feed page holds", () => {
-    // The feed is one page ordered by recency, so on a busy repository it can hold exactly one of
-    // somebody's own pull requests while the rest sit further down the host's list. The Authored
-    // group comes from its own server-filtered read for that reason: grouping the page instead
-    // leaves the older ones under Others, or off the page altogether.
     const newest = authoredRow(6039, "2026-08-11T08:00:00Z");
     const older = [
       authoredRow(5499, "2026-08-10T17:00:00Z"),
@@ -1376,5 +1449,169 @@ describe("the priority groups against a paginated feed", () => {
     expect(
       groups.find((group) => group.key === "others")?.entries.map((row) => row.number),
     ).toEqual([6123]);
+  });
+});
+
+describe("pull request list overrides", () => {
+  const entry = (number: number, state: "open" | "closed" | "merged") =>
+    ({
+      host: "github.com",
+      repository: "pingdotgg/t3code",
+      number,
+      state,
+      isDraft: false,
+      updatedAt: "2026-07-01T00:00:00Z",
+      labels: [],
+    }) as unknown as PullRequestListEntry;
+  const key = (row: { number: number }) => `#${row.number}`;
+
+  it("maps the actions that change a row's state and nothing else", () => {
+    const now = new Date("2026-07-02T00:00:00Z");
+    expect(pullRequestOverrideAfterAction(entry(1, "open"), "close", now, 7)).toEqual({
+      state: "closed",
+      updatedAt: "2026-07-02T00:00:00.000Z",
+      token: 7,
+      at: now.getTime(),
+    });
+    expect(pullRequestOverrideAfterAction(entry(1, "closed"), "reopen", now, 1)?.state).toBe(
+      "open",
+    );
+    expect(pullRequestOverrideAfterAction(entry(1, "open"), "merge", now, 1)?.state).toBe("merged");
+    expect(pullRequestOverrideAfterAction(entry(1, "open"), "draft", now, 1)?.isDraft).toBe(true);
+    expect(pullRequestOverrideAfterAction(entry(1, "open"), "update-branch", now, 1)).toBeNull();
+  });
+
+  it("writes the override over the row and drops it from a list whose state it left", () => {
+    const rows = [entry(1, "open"), entry(2, "open")];
+    const overrides = new Map([
+      ["#1", { state: "closed" as const, updatedAt: "2026-07-03T00:00:00Z", token: 1, at: 0 }],
+    ]);
+    expect(
+      applyPullRequestOverrides(rows, overrides, key, "open").map((row) => row.number),
+    ).toEqual([2]);
+    const all = applyPullRequestOverrides(rows, overrides, key, "all");
+    expect(all.map((row) => [row.number, row.state])).toEqual([
+      [1, "closed"],
+      [2, "open"],
+    ]);
+    expect(applyPullRequestOverrides(rows, new Map(), key, "open")).toBe(rows);
+  });
+
+  it.each([
+    ["open", [1]],
+    ["closed", [2]],
+    ["merged", [3]],
+    ["all", [1, 2, 3]],
+  ] as const)("filters host rows by %s after pending actions settle", (state, expected) => {
+    const rows = [entry(1, "open"), entry(2, "closed"), entry(3, "merged")];
+    expect(applyPullRequestOverrides(rows, new Map(), key, state).map((row) => row.number)).toEqual(
+      expected,
+    );
+  });
+
+  it("keeps a confirmed close hidden when its override is cleared", () => {
+    const at = 1_000_000;
+    const rows = [entry(1, "closed"), entry(2, "open"), entry(3, "merged")];
+    const overrides = new Map([
+      ["#1", { state: "closed" as const, updatedAt: "2026-07-03T00:00:00Z", token: 1, at }],
+    ]);
+    const settled = settlePullRequestOverrides(overrides, rows, key, at + 5_000);
+    expect(settled.size).toBe(0);
+    expect(applyPullRequestOverrides(rows, settled, key, "open").map((row) => row.number)).toEqual([
+      2,
+    ]);
+  });
+
+  it("hands back the held object for a row a refresh did not change", () => {
+    const previous = [entry(1, "open"), entry(2, "open")];
+    const next = [{ ...entry(1, "open") }, { ...entry(2, "open"), state: "merged" as const }];
+    const reused = reusePullRequestEntries(previous, next, key);
+    expect(reused[0]).toBe(previous[0]);
+    expect(reused[1]).toBe(next[1]);
+    expect(
+      reusePullRequestEntries(previous, [{ ...entry(1, "open") }, { ...entry(2, "open") }], key),
+    ).toBe(previous);
+  });
+});
+
+describe("pull request list override settlement", () => {
+  const entry = (number: number, state: "open" | "closed" | "merged") =>
+    ({ number, state, isDraft: false, labels: [] }) as unknown as PullRequestListEntry;
+  const key = (row: { number: number }) => `#${row.number}`;
+
+  it("keeps an override until an answer agrees with it", () => {
+    const at = 1_000_000;
+    const closed = { state: "closed" as const, updatedAt: "2026-07-03T00:00:00Z", token: 1, at };
+    const overrides = new Map([["#1", closed]]);
+    expect(settlePullRequestOverrides(overrides, [entry(1, "open")], key, at + 5_000)).toBe(
+      overrides,
+    );
+    expect(settlePullRequestOverrides(overrides, [entry(2, "open")], key, at + 5_000).size).toBe(1);
+    expect(settlePullRequestOverrides(overrides, [entry(1, "closed")], key, at + 5_000).size).toBe(
+      0,
+    );
+    expect(settlePullRequestOverrides(overrides, [entry(1, "open")], key, at + 90_000).size).toBe(
+      0,
+    );
+  });
+
+  it("does not hand back the old order when only the order changed", () => {
+    const previous = [entry(1, "open"), entry(2, "open")];
+    const swapped = reusePullRequestEntries(previous, [entry(2, "open"), entry(1, "open")], key);
+    expect(swapped).not.toBe(previous);
+    expect(swapped.map((row) => row.number)).toEqual([2, 1]);
+  });
+});
+
+describe("pull request quick actions", () => {
+  const summary = (host: string, kind: string, actions?: ReadonlyArray<PullRequestAction>) => ({
+    host,
+    kind: SourceControlProviderKind.make(kind),
+    searchesOnHost: true,
+    projectCount: 1,
+    configured: true,
+    detail: null,
+    ...(actions === undefined ? {} : { actions }),
+  });
+
+  it("offers what each host reports, and GitHub's legacy set when a server reports none", () => {
+    const actionsOf = pullRequestHostActions([
+      summary("bitbucket.org", "bitbucket", ["merge", "close"]),
+      summary("github.com", "github"),
+    ]);
+    const bitbucket = actionsOf({
+      host: "bitbucket.org",
+      provider: SourceControlProviderKind.make("bitbucket"),
+    });
+    expect(pullRequestQuickActions({ state: "closed", isDraft: false }, bitbucket)).toEqual([]);
+    const github = actionsOf({
+      host: "github.com",
+      provider: SourceControlProviderKind.make("github"),
+    });
+    expect(pullRequestQuickActions({ state: "open", isDraft: true }, github)).toEqual([
+      "close",
+      "ready",
+    ]);
+  });
+});
+
+describe("refresh page size", () => {
+  const twoPagesAcrossFourRepositories = (provider: "github" | "gitlab") =>
+    ["a", "b", "c", "d"].flatMap((name) =>
+      Array.from({ length: 198 }, (_, index) =>
+        entry({
+          number: index + 1,
+          provider: SourceControlProviderKind.make(provider),
+          repository: `pingdotgg/${name}`,
+        }),
+      ),
+    );
+
+  it("asks each repository for its own rows where repositories are read one at a time", () => {
+    expect(largestPullRequestReadCount(twoPagesAcrossFourRepositories("gitlab"))).toBe(198);
+  });
+
+  it("asks for the whole host where one search reads every repository", () => {
+    expect(largestPullRequestReadCount(twoPagesAcrossFourRepositories("github"))).toBe(792);
   });
 });

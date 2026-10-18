@@ -1,9 +1,12 @@
+import { settlePromise, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { useAtomValue } from "@effect/atom-react";
-import type { EnvironmentId } from "@t3tools/contracts";
-import { Atom } from "effect/unstable/reactivity";
+import { AuthOrchestrationOperateScope, type EnvironmentId } from "@t3tools/contracts";
+import { Atom, AsyncResult } from "effect/reactivity";
 import { useEffect, useRef } from "react";
 
 import { prepareTurnAttachments } from "../lib/attachmentUpload";
+import { retainComposerAttachmentFileForPreview } from "../lib/composerAttachmentPreviewRetention";
+import { isFileBackedComposerAttachment } from "../lib/composerImages";
 import {
   composerAttachmentUploadKey,
   composerDraftEnvironmentId,
@@ -16,15 +19,20 @@ import { useServerConfigs } from "./entities";
 import { flattenQueuedThreadMessages, threadOutboxManager } from "./thread-outbox";
 import { useThreadOutboxMessages } from "./use-thread-outbox";
 import {
+  ComposerDraftPersistenceError,
   composerDraftsAtom,
+  composerDraftUploadSourcesAtom,
   ensureComposerDraftsLoaded,
   flushComposerDrafts,
-  retainComposerAttachmentFileForPreview,
   setComposerDraftAttachmentUpload,
 } from "./use-composer-drafts";
 import { useRemoteConnectionStatus } from "./use-remote-environment-registry";
+import { readEnvironmentScope, useEnvironmentsWithScope } from "./session";
 
-export { composerAttachmentUploadBlockReason } from "../lib/composerAttachmentUploadQueue";
+export {
+  composerAttachmentUploadBlockReason,
+  composerAttachmentsStillUploading,
+} from "../lib/composerAttachmentUploadQueue";
 
 export const composerAttachmentUploadsAtom = Atom.make<
   Readonly<Record<string, ComposerAttachmentUploadState>>
@@ -44,15 +52,19 @@ export function useComposerAttachmentUploadState(
 }
 
 export function retryComposerAttachmentUpload(environmentId: EnvironmentId, attachmentId: string) {
+  if (!readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)) return;
   uploadQueue?.retry(environmentId, attachmentId);
 }
 
-/** Runs outside mounted composers so a transfer can finish after navigation. */
 export function useComposerAttachmentUploadWorker() {
-  const drafts = useAtomValue(composerDraftsAtom);
+  const drafts = useAtomValue(composerDraftUploadSourcesAtom);
   const queuedMessages = useThreadOutboxMessages();
   const serverConfigs = useServerConfigs();
   const { connectedEnvironments } = useRemoteConnectionStatus();
+  const operableEnvironments = useEnvironmentsWithScope(
+    connectedEnvironments,
+    AuthOrchestrationOperateScope,
+  );
   const queueRef = useRef<ReturnType<typeof createComposerAttachmentUploadQueue> | null>(null);
 
   useEffect(() => {
@@ -60,12 +72,11 @@ export function useComposerAttachmentUploadWorker() {
     const queue = createComposerAttachmentUploadQueue({
       onChange: (states) => appAtomRegistry.set(composerAttachmentUploadsAtom, states),
       upload: async ({ environmentId, attachment }, signal, onProgress) => {
-        const release =
-          attachment.type === "file"
-            ? retainComposerAttachmentFileForPreview(attachment)
-            : undefined;
-        try {
-          const result = await prepareTurnAttachments({
+        const release = isFileBackedComposerAttachment(attachment)
+          ? retainComposerAttachmentFileForPreview(attachment)
+          : undefined;
+        const prepared = await settlePromise(() =>
+          prepareTurnAttachments({
             environmentId,
             attachments: [attachment],
             supportsImageUploads: true,
@@ -79,21 +90,28 @@ export function useComposerAttachmentUploadWorker() {
               let retained = false;
               for (const [key, draft] of Object.entries(appAtomRegistry.get(composerDraftsAtom))) {
                 if (
-                  composerDraftEnvironmentId(key, queued) === environmentId &&
+                  composerDraftEnvironmentId(key, queued, draft) === environmentId &&
                   draft.attachments.some((candidate) => candidate.id === attachment.id)
                 ) {
                   retained = setComposerDraftAttachmentUpload(key, uploaded) || retained;
                 }
               }
               if (!retained) return "abandon";
-              await flushComposerDrafts();
+              // The reference is already in the in-memory draft, and Send copies it into the
+              // outbox, which saves on its own. A failed draft save only costs a re-upload after
+              // a restart, so it must not fail an upload the server already accepted.
+              await flushComposerDrafts().catch((error: unknown) => {
+                if (!(error instanceof ComposerDraftPersistenceError)) throw error;
+                console.warn("[composer-attachments] could not save the uploaded reference", error);
+              });
               return "persisted";
             },
-          });
-          return result.status === "ready";
-        } finally {
-          release?.();
-        }
+          }),
+        );
+        release?.();
+        // The upload queue owns retry and failure reporting, so a failed upload rethrows to it.
+        if (AsyncResult.isFailure(prepared)) throw squashAtomCommandFailure(prepared);
+        return prepared.value.status === "ready";
       },
     });
     queueRef.current = queue;
@@ -113,8 +131,13 @@ export function useComposerAttachmentUploadWorker() {
         .map((environment) => environment.environmentId),
     );
     const requests = Object.entries(drafts).flatMap(([key, draft]) => {
-      const environmentId = composerDraftEnvironmentId(key, queued);
-      if (environmentId === null || !connected.has(environmentId)) return [];
+      const environmentId = composerDraftEnvironmentId(key, queued, draft);
+      if (
+        environmentId === null ||
+        !connected.has(environmentId) ||
+        !operableEnvironments.has(environmentId)
+      )
+        return [];
       return draft.attachments
         .filter((attachment) =>
           canUploadComposerAttachment(attachment, serverConfigs.get(environmentId)),
@@ -122,5 +145,5 @@ export function useComposerAttachmentUploadWorker() {
         .map((attachment) => ({ environmentId, attachment }));
     });
     queueRef.current?.sync(requests);
-  }, [connectedEnvironments, drafts, queuedMessages, serverConfigs]);
+  }, [connectedEnvironments, drafts, operableEnvironments, queuedMessages, serverConfigs]);
 }

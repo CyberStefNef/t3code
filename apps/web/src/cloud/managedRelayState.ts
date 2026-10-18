@@ -18,8 +18,8 @@ import type { EnvironmentId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
-import { useCallback, useEffect } from "react";
+import { AsyncResult, Atom } from "effect/reactivity";
+import { useEffect } from "react";
 
 import { runtime } from "../lib/runtime";
 import { appAtomRegistry } from "../rpc/atomRegistry";
@@ -33,7 +33,7 @@ const managedRelayAtomRuntime = Atom.runtime(
   ),
 );
 
-export const managedRelayQueryManager = createManagedRelayQueryManager(managedRelayAtomRuntime);
+const managedRelayQueryManager = createManagedRelayQueryManager(managedRelayAtomRuntime);
 
 const managedRelayMutationScheduler = createAtomCommandScheduler();
 
@@ -75,11 +75,11 @@ export function useManagedRelayEnvironments() {
       });
     }
   }, [snapshot.error, snapshot.errorTraceId]);
-  const refresh = useCallback(() => {
+  const refresh = () => {
     if (accountId) {
       managedRelayQueryManager.refreshEnvironments(appAtomRegistry, accountId);
     }
-  }, [accountId]);
+  };
 
   return {
     ...snapshot,
@@ -102,22 +102,15 @@ export function useManagedRelayDevices() {
       });
     }
   }, [snapshot.error, snapshot.errorTraceId]);
-  const refresh = useCallback(() => {
+  const refresh = () => {
     if (accountId) {
       managedRelayQueryManager.refreshDevices(appAtomRegistry, accountId);
     }
-  }, [accountId]);
+  };
 
   return {
     ...snapshot,
     accountId,
     refresh,
   };
-}
-
-export function refreshManagedRelayEnvironments(): void {
-  const session = appAtomRegistry.get(managedRelaySessionAtom);
-  if (session) {
-    managedRelayQueryManager.refreshEnvironments(appAtomRegistry, session.accountId);
-  }
 }

@@ -1,3 +1,5 @@
+// @effect-diagnostics nodeBuiltinImport:off - expectations mirror the host path joins the script under test performs.
+import * as NodePath from "node:path";
 import { assert, it } from "@effect/vitest";
 import { PNG } from "pngjs";
 
@@ -110,8 +112,6 @@ it("parses repeatable and expanded theme filters", () => {
   );
 });
 
-// The app normalizes an unknown id back to its default palette, so a typo here
-// would otherwise produce screenshots labeled with a theme they do not show.
 it("rejects unsupported themes instead of capturing the default palette", () => {
   assert.throws(() => parseShowcaseCliArgs(["--theme", "sunset"]), /Unsupported theme 'sunset'/u);
 });
@@ -167,14 +167,18 @@ it("expands both appearances into independent upload-ready directories", () => {
       directory: showcaseCaptureDirectory("/captures", capture),
     })),
     [
-      { appearance: "light", directory: "/captures/apple/iphone-test/light/t3-code" },
-      { appearance: "dark", directory: "/captures/apple/iphone-test/dark/t3-code" },
+      {
+        appearance: "light",
+        directory: NodePath.join("/captures", "apple", "iphone-test", "light", "t3-code"),
+      },
+      {
+        appearance: "dark",
+        directory: NodePath.join("/captures", "apple", "iphone-test", "dark", "t3-code"),
+      },
     ],
   );
 });
 
-// Every palette needs its own leaf folder: one directory holding several themes
-// would mix upload slots and break the per-store screenshot count limits.
 it("expands themes into independent upload-ready directories per appearance", () => {
   const options = parseShowcaseCliArgs([
     "--device",
@@ -192,10 +196,10 @@ it("expands themes into independent upload-ready directories per appearance", ()
       showcaseCaptureDirectory("/captures", capture),
     ),
     [
-      "/captures/apple/iphone-test/light/ocean",
-      "/captures/apple/iphone-test/light/ember",
-      "/captures/apple/iphone-test/dark/ocean",
-      "/captures/apple/iphone-test/dark/ember",
+      NodePath.join("/captures", "apple", "iphone-test", "light", "ocean"),
+      NodePath.join("/captures", "apple", "iphone-test", "light", "ember"),
+      NodePath.join("/captures", "apple", "iphone-test", "dark", "ocean"),
+      NodePath.join("/captures", "apple", "iphone-test", "dark", "ember"),
     ],
   );
 });
@@ -325,8 +329,6 @@ it("seeds a playful multi-environment project spectrum", () => {
   }
   const primaryThread = SHOWCASE_THREADS.find((thread) => thread.id === "remote-command-center");
   assert.equal(primaryThread !== undefined && !("snoozeMinutes" in primaryThread), true);
-  // Every project contributes to both the active block and the settled tail,
-  // so each list scope screenshots with the same two-part structure.
   for (const project of SHOWCASE_PROJECTS) {
     const projectThreads = SHOWCASE_THREADS.filter((thread) => thread.projectId === project.id);
     assert.equal(

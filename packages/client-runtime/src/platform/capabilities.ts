@@ -1,6 +1,5 @@
 import {
   type AuthClientPresentationMetadata,
-  type AuthEnvironmentScope,
   type DesktopSshEnvironmentBootstrap,
   type DesktopSshEnvironmentTarget,
   EnvironmentId,
@@ -21,9 +20,15 @@ export interface ProvisionedSshEnvironment extends PreparedSshEnvironment {
   readonly label: string;
 }
 
+/** Stable for one signed-in session, including same-account token refreshes. */
+export interface CloudSessionIdentity {
+  readonly accountId: string;
+}
+
 export class CloudSession extends Context.Service<
   CloudSession,
   {
+    readonly identity: Effect.Effect<Option.Option<CloudSessionIdentity>>;
     readonly clerkToken: Effect.Effect<string, ConnectionAttemptError>;
   }
 >()("@t3tools/client-runtime/platform/capabilities/CloudSession") {}
@@ -39,7 +44,6 @@ export class ClientPresentation extends Context.Service<
   ClientPresentation,
   {
     readonly metadata: AuthClientPresentationMetadata;
-    readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
   }
 >()("@t3tools/client-runtime/platform/capabilities/ClientPresentation") {}
 
@@ -53,13 +57,25 @@ export class PrimaryEnvironmentAuth extends Context.Service<
 export class SshEnvironmentGateway extends Context.Service<
   SshEnvironmentGateway,
   {
+    /**
+     * With `expectedEnvironmentId`, a server that is a different machine fails
+     * before its one-time pairing credential is spent.
+     */
     readonly provision: (
       target: DesktopSshEnvironmentTarget,
+      expectedEnvironmentId?: EnvironmentId,
     ) => Effect.Effect<ProvisionedSshEnvironment, ConnectionAttemptError>;
+    /**
+     * Starts or reuses the remote server for a saved connection. Returns
+     * `bearerToken`, the token this client saved from an earlier pairing, while
+     * the host still accepts it with the standard scopes, and pairs again only
+     * when it does not, so a reconnect adds no session on the host.
+     */
     readonly prepare: (input: {
       readonly connectionId: string;
       readonly expectedEnvironmentId: EnvironmentId;
       readonly target: DesktopSshEnvironmentTarget;
+      readonly bearerToken?: string;
     }) => Effect.Effect<PreparedSshEnvironment, ConnectionAttemptError>;
     readonly disconnect: (
       target: DesktopSshEnvironmentTarget,

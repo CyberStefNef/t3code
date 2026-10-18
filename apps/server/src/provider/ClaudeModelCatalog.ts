@@ -1,15 +1,17 @@
 import {
+  type CustomModelSetting,
   type ModelCapabilities,
   type ModelSelection,
   ProviderDriverKind,
   type ServerProviderModel,
+  type ServerProviderUpdateRequiredModel,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import {
   getModelSelectionStringOptionValue,
   getProviderOptionCurrentValue,
   getProviderOptionDescriptors,
-  normalizeCustomModelSlug,
+  readCustomModelEntries,
 } from "@t3tools/shared/model";
 import { compareSemverVersions } from "@t3tools/shared/semver";
 
@@ -19,11 +21,8 @@ import {
   decodeClaudeModelAdapter,
   decodeClaudeProfileAdapter,
 } from "./ClaudeModelManifest.ts";
-import {
-  BUNDLED_MODEL_MANIFEST,
-  type ModelManifestData,
-  resolveProviderCatalog,
-} from "./ModelManifest.ts";
+import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
+import { BUNDLED_MODEL_MANIFEST, resolveProviderCatalog } from "./ModelManifest.ts";
 
 const CLAUDE = ProviderDriverKind.make("claudeAgent");
 const EMPTY_CAPABILITIES: ModelCapabilities = { optionDescriptors: [] };
@@ -38,8 +37,9 @@ export interface ClaudeModelCatalog {
   readonly models: ReadonlyArray<ClaudeCatalogModel>;
 }
 
-function tryResolveClaudeModelCatalog(manifest: ModelManifestData): ClaudeModelCatalog | null {
-  const resolved = resolveProviderCatalog(manifest, CLAUDE);
+function tryResolveClaudeModelCatalog(
+  resolved: ModelCatalog.ProviderCatalog | undefined,
+): ClaudeModelCatalog | null {
   if (!resolved) return null;
 
   const models: Array<ClaudeCatalogModel> = [];
@@ -48,7 +48,7 @@ function tryResolveClaudeModelCatalog(manifest: ModelManifestData): ClaudeModelC
     const adapter = decodeClaudeModelAdapter(entry.adapter ?? {});
     if (Option.isNone(profile) || Option.isNone(adapter)) return null;
     models.push({
-      model: entry.model,
+      model: ModelCatalog.catalogServerModel(resolved, entry),
       runtime: profile.value.claudeCode ?? {},
       compatibility: adapter.value.claudeCode ?? {},
     });
@@ -59,47 +59,64 @@ function tryResolveClaudeModelCatalog(manifest: ModelManifestData): ClaudeModelC
   };
 }
 
-export function resolveClaudeModelCatalog(manifest: ModelManifestData): ClaudeModelCatalog {
+const BUNDLED_CLAUDE_PROVIDER_CATALOG =
+  resolveProviderCatalog(BUNDLED_MODEL_MANIFEST, CLAUDE) ?? undefined;
+
+export function resolveClaudeModelCatalog(
+  catalog: ModelCatalog.ProviderCatalog | undefined,
+): ClaudeModelCatalog {
   return (
-    tryResolveClaudeModelCatalog(manifest) ??
-    tryResolveClaudeModelCatalog(BUNDLED_MODEL_MANIFEST) ?? {
+    tryResolveClaudeModelCatalog(catalog) ??
+    tryResolveClaudeModelCatalog(BUNDLED_CLAUDE_PROVIDER_CATALOG) ?? {
       models: [],
     }
   );
 }
 
-export const BUNDLED_CLAUDE_MODEL_CATALOG = resolveClaudeModelCatalog(BUNDLED_MODEL_MANIFEST);
+export const BUNDLED_CLAUDE_MODEL_CATALOG = resolveClaudeModelCatalog(
+  BUNDLED_CLAUDE_PROVIDER_CATALOG,
+);
 
-/** Keeps custom model aliases opaque while preserving canonical built-in models and capabilities. */
 export function scopeClaudeModelCatalog(
   catalog: ClaudeModelCatalog,
-  customModels: ReadonlyArray<string>,
+  customModels: ReadonlyArray<CustomModelSetting>,
 ): ClaudeModelCatalog {
-  const customAliases = new Set(
-    customModels.flatMap((model) => {
-      const slug = normalizeCustomModelSlug(model);
-      return slug ? [slug.toLowerCase()] : [];
-    }),
-  );
-  if (customAliases.size === 0) return catalog;
+  const customEntries = readCustomModelEntries(customModels);
+  if (customEntries.length === 0) return catalog;
+  const customAliases = new Set(customEntries.map((entry) => entry.slug.toLowerCase()));
 
-  return {
-    models: catalog.models.map((entry) => {
-      if (!entry.model.aliases?.some((alias) => customAliases.has(alias.toLowerCase()))) {
-        return entry;
-      }
-      return {
-        ...entry,
-        model: {
-          ...entry.model,
-          aliases: entry.model.aliases.filter((alias) => !customAliases.has(alias.toLowerCase())),
-        },
-      };
-    }),
-  };
+  const builtInModels = catalog.models.map((entry) => {
+    if (!entry.model.aliases?.some((alias) => customAliases.has(alias.toLowerCase()))) {
+      return entry;
+    }
+    return {
+      ...entry,
+      model: {
+        ...entry.model,
+        aliases: entry.model.aliases.filter((alias) => !customAliases.has(alias.toLowerCase())),
+      },
+    };
+  });
+  const builtInSlugs = new Set(builtInModels.map((entry) => entry.model.slug));
+  const customCatalogModels: Array<ClaudeCatalogModel> = [];
+  for (const entry of customEntries) {
+    if (!entry.capabilities || builtInSlugs.has(entry.slug)) continue;
+    customCatalogModels.push({
+      model: {
+        slug: entry.slug,
+        name: entry.name,
+        isCustom: true,
+        capabilities: entry.capabilities,
+      },
+      runtime: {},
+      compatibility: {},
+    });
+  }
+
+  return { models: [...builtInModels, ...customCatalogModels] };
 }
 
-export function resolveClaudeCatalogModel(
+function resolveClaudeCatalogModel(
   catalog: ClaudeModelCatalog,
   slugOrAlias: string | null | undefined,
 ): ClaudeCatalogModel | undefined {
@@ -148,6 +165,27 @@ export function resolveClaudeModelsForVersion(
     .map((entry) => entry.model);
 }
 
+export function resolveClaudeUpdateRequiredModels(
+  catalog: ClaudeModelCatalog,
+  version: string | null | undefined,
+): ReadonlyArray<ServerProviderUpdateRequiredModel> {
+  if (!version) return [];
+  return catalog.models.flatMap(({ model, compatibility }) => {
+    const minVersion = compatibility.minVersion;
+    if (model.isLegacy || !minVersion || compareSemverVersions(version, minVersion) >= 0) {
+      return [];
+    }
+    return [
+      {
+        slug: model.slug,
+        name: model.name,
+        ...(model.badge ? { badge: model.badge } : {}),
+        minVersion,
+      },
+    ];
+  });
+}
+
 export function formatClaudeVersionUpgradeMessage(
   catalog: ClaudeModelCatalog,
   version: string | null,
@@ -171,6 +209,13 @@ export function resolveClaudeCatalogEffort(
   model: string | null | undefined,
   raw: string | null | undefined,
 ): string | undefined {
+  if (!resolveClaudeCatalogModel(catalog, model)) {
+    const effort = raw?.trim();
+    return effort && ["low", "medium", "high", "xhigh", "max"].includes(effort)
+      ? effort
+      : undefined;
+  }
+
   const caps = getClaudeCatalogModelCapabilities(catalog, model);
   const descriptors = getProviderOptionDescriptors({
     caps,
@@ -196,7 +241,7 @@ export function isClaudeCatalogUltracodeEffort(effort: string | null | undefined
   return effort === "ultracode";
 }
 
-export function resolveClaudeCatalogContextWindow(
+function resolveClaudeCatalogContextWindow(
   catalog: ClaudeModelCatalog,
   modelSelection: ModelSelection | undefined,
 ): string | undefined {

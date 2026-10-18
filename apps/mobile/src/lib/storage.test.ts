@@ -196,6 +196,25 @@ describe("mobile connection storage", () => {
     });
   });
 
+  it("persists Material You independently for each appearance", async () => {
+    const themes = { lightThemeId: "material-you", darkThemeId: "ocean" } as const;
+    await savePreferencesPatch(themes);
+    await expect(loadPreferences()).resolves.toEqual(themes);
+    await savePreferencesPatch({ lightThemeId: "t3-chat" });
+    await expect(loadPreferences()).resolves.toEqual({ ...themes, lightThemeId: "t3-chat" });
+  });
+
+  it.each([true, false])("drops the removed Android layout preference (%s)", async (enabled) => {
+    mocks.setPreferencesJson(
+      JSON.stringify({
+        materialYouStyleLayoutEnabled: enabled,
+        lightThemeId: "t3-chat",
+      }),
+      10,
+    );
+    await expect(loadPreferences()).resolves.toEqual({ lightThemeId: "t3-chat" });
+  });
+
   it("drops the removed theme transition preference", async () => {
     mocks.setPreferencesJson(JSON.stringify({ themeTransition: "circle-bottom-left" }), 10);
 
@@ -213,24 +232,32 @@ describe("mobile connection storage", () => {
     expect(fallback.updatedAt).toEqual(expect.any(Number));
   });
 
-  it("persists thread list shelf expansion preferences", async () => {
+  it("persists thread list shelf preferences", async () => {
     await expect(
       savePreferencesPatch({
         threadListSettledShelfExpanded: false,
         threadListSnoozedShelfExpanded: true,
+        threadListWorkingShelfExpanded: true,
+        workingShelfEnabled: true,
       }),
     ).resolves.toEqual({
       threadListSettledShelfExpanded: false,
       threadListSnoozedShelfExpanded: true,
+      threadListWorkingShelfExpanded: true,
+      workingShelfEnabled: true,
     });
 
     await expect(loadPreferences()).resolves.toEqual({
       threadListSettledShelfExpanded: false,
       threadListSnoozedShelfExpanded: true,
+      threadListWorkingShelfExpanded: true,
+      workingShelfEnabled: true,
     });
     expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual({
       threadListSettledShelfExpanded: false,
       threadListSnoozedShelfExpanded: true,
+      threadListWorkingShelfExpanded: true,
+      workingShelfEnabled: true,
     });
   });
 
@@ -247,6 +274,32 @@ describe("mobile connection storage", () => {
     );
 
     await expect(loadPreferences()).resolves.toEqual({ baseFontSize: 17 });
+  });
+
+  it("keeps valid list filters and drops malformed ones", async () => {
+    const threadListFilters = { environmentId: "environment-1", projectKey: null };
+    const pullRequestListFilters = {
+      environmentId: null,
+      controls: {
+        "": {
+          state: "all",
+          involvement: "reviewing",
+          filters: { labels: [["size:S"]] },
+          sort: "oldest",
+        },
+      },
+    };
+    mocks.setPreferencesJson(JSON.stringify({ threadListFilters, pullRequestListFilters }), 10);
+    await expect(loadPreferences()).resolves.toEqual({ threadListFilters, pullRequestListFilters });
+
+    mocks.setPreferencesJson(
+      JSON.stringify({
+        threadListFilters: { environmentId: 1, projectKey: null },
+        pullRequestListFilters: { environmentId: null, controls: { "": { sort: "newest" } } },
+      }),
+      11,
+    );
+    await expect(loadPreferences()).resolves.toEqual({});
   });
 
   it("reconciles fallback preferences after SQLite recovers", async () => {

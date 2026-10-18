@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 import { pipe } from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 
 import {
   isRelayManagedConnection,
@@ -18,7 +19,7 @@ const AGENT_AWARENESS_DEVICE_ID_KEY = "t3code.agent-awareness.device-id";
 const AGENT_AWARENESS_REGISTRATION_KEY = "t3code.agent-awareness.registration";
 const RECENT_THREAD_SHORTCUTS_KEY = "t3code.recent-thread-shortcuts";
 
-export class MobileStorageDecodeError extends Schema.TaggedErrorClass<MobileStorageDecodeError>()(
+export class MobileStorageDecodeError extends Schema.TaggedError<MobileStorageDecodeError>()(
   "MobileStorageDecodeError",
   {
     key: Schema.String,
@@ -30,7 +31,7 @@ export class MobileStorageDecodeError extends Schema.TaggedErrorClass<MobileStor
   }
 }
 
-export class MobileStorageEncodeError extends Schema.TaggedErrorClass<MobileStorageEncodeError>()(
+export class MobileStorageEncodeError extends Schema.TaggedError<MobileStorageEncodeError>()(
   "MobileStorageEncodeError",
   {
     key: Schema.String,
@@ -42,7 +43,7 @@ export class MobileStorageEncodeError extends Schema.TaggedErrorClass<MobileStor
   }
 }
 
-export class MobileDeviceIdGenerationError extends Schema.TaggedErrorClass<MobileDeviceIdGenerationError>()(
+export class MobileDeviceIdGenerationError extends Schema.TaggedError<MobileDeviceIdGenerationError>()(
   "MobileDeviceIdGenerationError",
   { cause: Schema.Defect() },
 ) {
@@ -119,6 +120,7 @@ export class MobileStorage extends Context.Service<
 
 export const make = Effect.fn("MobileStorage.make")(function* () {
   const secureStorage = yield* MobileSecureStorage.MobileSecureStorage;
+  const deviceIdLock = yield* Semaphore.make(1);
 
   const parseJson = <A>(key: string, raw: string): A | null => {
     if (!raw.trim()) return null;
@@ -197,7 +199,7 @@ export const make = Effect.fn("MobileStorage.make")(function* () {
     });
     yield* secureStorage.setItem(AGENT_AWARENESS_DEVICE_ID_KEY, deviceId);
     return deviceId;
-  });
+  }).pipe(deviceIdLock.withPermits(1));
 
   const loadAgentAwarenessDeviceId = secureStorage
     .getItem(AGENT_AWARENESS_DEVICE_ID_KEY)
@@ -225,8 +227,6 @@ export const make = Effect.fn("MobileStorage.make")(function* () {
     }),
   );
 
-  // Threads most recently opened on this device, newest first — the source
-  // for the launcher's dynamic "recent thread" app shortcuts.
   const loadRecentThreadShortcuts = readJson<{
     readonly threads?: ReadonlyArray<RecentThreadShortcut>;
   }>(RECENT_THREAD_SHORTCUTS_KEY).pipe(

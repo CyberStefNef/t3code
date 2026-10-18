@@ -1,67 +1,20 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ProviderDriverKind, type ServerProviderModel } from "@t3tools/contracts";
+import { ProviderDriverKind } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as TestClock from "effect/testing/TestClock";
-import { HttpClient, HttpClientResponse } from "effect/unstable/http";
+import { HttpClient, HttpClientResponse } from "effect/http";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
-import {
-  BUNDLED_MODEL_MANIFEST,
-  classifyModels,
-  make,
-  resolveProviderCatalog,
-  type ModelManifestData,
-} from "./ModelManifest.ts";
-
-/**
- * Test policy: this file covers manifest machinery, not manifest contents.
- * Do not add assertions for real model slugs, names, status, aliases, or
- * profiles when editing model-manifest.json. Add tests only when fetch/cache
- * behavior or the provider-neutral resolver semantics change, and use
- * synthetic models for resolver coverage.
- */
-
-const CODEX = ProviderDriverKind.make("codex");
-const model = (overrides: Partial<ServerProviderModel>): ServerProviderModel => ({
-  slug: "gpt-test",
-  name: "GPT Test",
-  isCustom: false,
-  capabilities: null,
-  ...overrides,
-});
-
-describe("classifyModels", () => {
-  it("flags non-current models, clears stale flags, and skips custom models", () => {
-    const manifest: ModelManifestData = {
-      version: 1,
-      currentModels: { codex: ["current-a", "current-b"] },
-    };
-    const models = [
-      model({ slug: "current-a" }),
-      // Stale flag from a previous classification pass must be cleared.
-      model({ slug: "current-b", isLegacy: true }),
-      model({ slug: "old-model" }),
-      // Custom models are user-defined and never reclassified.
-      model({ slug: "my-own-model", isCustom: true }),
-    ];
-    assert.deepStrictEqual(
-      classifyModels(models, manifest, CODEX).map((entry) => [entry.slug, entry.isLegacy ?? false]),
-      [
-        ["current-a", false],
-        ["current-b", false],
-        ["old-model", true],
-        ["my-own-model", false],
-      ],
-    );
-  });
-});
+import * as ModelManifest from "./ModelManifest.ts";
 
 describe("resolveProviderCatalog", () => {
   it("resolves generic model presentation through a reusable profile", () => {
-    const manifest: ModelManifestData = {
+    const manifest: ModelManifest.ModelManifestData = {
       version: 1,
       currentModels: {},
       providers: {
@@ -96,27 +49,28 @@ describe("resolveProviderCatalog", () => {
       },
     };
 
-    const catalog = resolveProviderCatalog(manifest, ProviderDriverKind.make("synthetic"));
+    const catalog = ModelManifest.resolveProviderCatalog(
+      manifest,
+      ProviderDriverKind.make("synthetic"),
+    );
     assert.deepStrictEqual(catalog?.models[0], {
-      model: {
-        slug: "model-next",
-        name: "Model Next",
-        aliases: ["next"],
-        badge: "new",
-        isCustom: false,
-        isDefault: true,
-        capabilities: manifest.providers!.synthetic!.profiles.standard!.capabilities!,
-      },
+      slug: "model-next",
+      name: "Model Next",
+      aliases: ["next"],
+      badge: "new",
+      status: "current",
+      capabilities: manifest.providers!.synthetic!.profiles.standard!.capabilities!,
       adapter: undefined,
       profileAdapter: { opaque: true },
     });
+    assert.strictEqual(catalog?.defaultChatModel, "model-next");
   });
 
   it("rejects invalid catalog references", () => {
     const invalidCatalog = (input: {
-      readonly models: NonNullable<ModelManifestData["providers"]>[string]["models"];
+      readonly models: NonNullable<ModelManifest.ModelManifestData["providers"]>[string]["models"];
       readonly defaultChat?: string;
-    }): ModelManifestData => ({
+    }): ModelManifest.ModelManifestData => ({
       version: 1,
       currentModels: {},
       providers: {
@@ -150,21 +104,27 @@ describe("resolveProviderCatalog", () => {
         defaultChat: "absent",
       }),
     ]) {
-      assert.isNull(resolveProviderCatalog(invalid, ProviderDriverKind.make("synthetic")));
+      assert.isNull(
+        ModelManifest.resolveProviderCatalog(invalid, ProviderDriverKind.make("synthetic")),
+      );
     }
   });
 });
 
-const REMOTE_MANIFEST: ModelManifestData = {
+const REMOTE_UPDATED_AT = "2099-01-01T00:00:00Z";
+
+const REMOTE_MANIFEST: ModelManifest.ModelManifestData = {
   version: 1,
+  updatedAt: REMOTE_UPDATED_AT,
   currentModels: {
     codex: ["remote-model"],
     claudeAgent: ["remote-agent-model"],
   },
 };
 
-const REMOTE_CLAUDE_MANIFEST: ModelManifestData = {
+const REMOTE_CLAUDE_MANIFEST: ModelManifest.ModelManifestData = {
   version: 1,
+  updatedAt: REMOTE_UPDATED_AT,
   currentModels: {},
   providers: {
     claudeAgent: {
@@ -185,7 +145,9 @@ const REMOTE_CLAUDE_MANIFEST: ModelManifestData = {
   },
 };
 
-const remoteClaudeManifestWithCompatibility = (compatibility: unknown): ModelManifestData => ({
+const remoteClaudeManifestWithCompatibility = (
+  compatibility: unknown,
+): ModelManifest.ModelManifestData => ({
   ...REMOTE_CLAUDE_MANIFEST,
   providers: {
     claudeAgent: {
@@ -198,7 +160,7 @@ const remoteClaudeManifestWithCompatibility = (compatibility: unknown): ModelMan
   },
 });
 
-const INVALID_REMOTE_MANIFESTS: ReadonlyArray<ModelManifestData> = [
+const INVALID_REMOTE_MANIFESTS: ReadonlyArray<ModelManifest.ModelManifestData> = [
   {
     ...REMOTE_CLAUDE_MANIFEST,
     providers: {
@@ -256,13 +218,13 @@ const INVALID_REMOTE_MANIFESTS: ReadonlyArray<ModelManifestData> = [
   }),
 ];
 
-const httpClientLayer = (handler: () => Response) =>
+const layerHttpClient = (handler: () => Response) =>
   Layer.succeed(
     HttpClient.HttpClient,
     HttpClient.make((request) => Effect.succeed(HttpClientResponse.fromWeb(request, handler()))),
   );
 
-const serviceLayers = (input: {
+const layerService = (input: {
   readonly prefix: string;
   readonly response: () => Response;
   readonly settings?: Parameters<typeof ServerSettings.layerTest>[0];
@@ -270,24 +232,100 @@ const serviceLayers = (input: {
   ServerConfig.layerTest(process.cwd(), { prefix: input.prefix }).pipe(
     Layer.provideMerge(NodeServices.layer),
     Layer.provideMerge(ServerSettings.layerTest(input.settings ?? {})),
-    Layer.provideMerge(httpClientLayer(input.response)),
+    Layer.provideMerge(layerHttpClient(input.response)),
   );
 
 describe("ModelManifest service", () => {
+  it.live("explicit refresh bypasses fresh memory and disk caches", () => {
+    let fetchCount = 0;
+    const updated: ModelManifest.ModelManifestData = {
+      ...REMOTE_MANIFEST,
+      currentModels: { codex: ["gpt-reloaded"] },
+    };
+    return Effect.gen(function* () {
+      const service = yield* ModelManifest.make;
+      assert.deepStrictEqual(yield* service.refresh, REMOTE_MANIFEST);
+      assert.deepStrictEqual(yield* service.refresh, REMOTE_MANIFEST);
+      assert.strictEqual(fetchCount, 1);
+
+      const rebooted = yield* ModelManifest.make;
+      assert.deepStrictEqual(yield* rebooted.refresh, REMOTE_MANIFEST);
+      assert.strictEqual(fetchCount, 1);
+      assert.deepStrictEqual(yield* rebooted.forceRefresh, updated);
+      assert.strictEqual(fetchCount, 2);
+      assert.deepStrictEqual(yield* rebooted.current, updated);
+      assert.deepStrictEqual(yield* (yield* ModelManifest.make).current, updated);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        layerService({
+          prefix: "model-manifest-force-refresh-test",
+          response: () => Response.json(fetchCount++ === 0 ? REMOTE_MANIFEST : updated),
+        }),
+      ),
+    );
+  });
+
+  it.live("explicit refresh retries immediately after failure and preserves last-good data", () => {
+    let fetchCount = 0;
+    return Effect.gen(function* () {
+      const service = yield* ModelManifest.make;
+      assert.deepStrictEqual(yield* service.refresh, REMOTE_MANIFEST);
+      assert.deepStrictEqual(yield* service.forceRefresh, REMOTE_MANIFEST);
+      assert.deepStrictEqual(yield* service.current, REMOTE_MANIFEST);
+      assert.deepStrictEqual(yield* (yield* ModelManifest.make).current, REMOTE_MANIFEST);
+      assert.strictEqual(fetchCount, 2);
+      assert.deepStrictEqual(yield* service.forceRefresh, REMOTE_MANIFEST);
+      assert.strictEqual(fetchCount, 3);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        layerService({
+          prefix: "model-manifest-force-retry-test",
+          response: () =>
+            fetchCount++ === 1
+              ? new Response(null, { status: 503 })
+              : Response.json(REMOTE_MANIFEST),
+        }),
+      ),
+    );
+  });
+
+  it.live("explicit refresh bypasses the retry delay after an initial failure", () => {
+    let fetchCount = 0;
+    return Effect.gen(function* () {
+      const service = yield* ModelManifest.make;
+      assert.deepStrictEqual(yield* service.refresh, ModelManifest.BUNDLED_MODEL_MANIFEST);
+      assert.deepStrictEqual(yield* service.refresh, ModelManifest.BUNDLED_MODEL_MANIFEST);
+      assert.strictEqual(fetchCount, 1);
+      assert.deepStrictEqual(yield* service.forceRefresh, REMOTE_MANIFEST);
+      assert.strictEqual(fetchCount, 2);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        layerService({
+          prefix: "model-manifest-force-initial-retry-test",
+          response: () =>
+            fetchCount++ === 0
+              ? new Response(null, { status: 503 })
+              : Response.json(REMOTE_MANIFEST),
+        }),
+      ),
+    );
+  });
+
   it.live("prefers a fetched manifest over the bundle and caches it to disk", () =>
     Effect.gen(function* () {
-      const service = yield* make;
+      const service = yield* ModelManifest.make;
       const refreshed = yield* service.refresh;
       assert.deepStrictEqual(refreshed, REMOTE_MANIFEST);
 
-      // A fresh service instance sees the disk cache without another fetch:
-      // its HTTP layer is still stubbed, but `current` never fetches at all.
-      const rebooted = yield* make;
+      const rebooted = yield* ModelManifest.make;
       assert.deepStrictEqual(yield* rebooted.current, REMOTE_MANIFEST);
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
           prefix: "model-manifest-fetch-test",
           response: () => Response.json(REMOTE_MANIFEST),
         }),
@@ -295,14 +333,38 @@ describe("ModelManifest service", () => {
     ),
   );
 
-  it.live("keeps the bundled manifest when the remote payload is malformed", () =>
-    Effect.gen(function* () {
-      const service = yield* make;
-      assert.deepStrictEqual(yield* service.refresh, BUNDLED_MODEL_MANIFEST);
+  it.live("ignores older remote edits without replacing the current manifest or disk cache", () => {
+    let remote = { ...REMOTE_MANIFEST, updatedAt: "2000-01-01T00:00:00Z" };
+    return Effect.gen(function* () {
+      const service = yield* ModelManifest.make;
+      assert.deepStrictEqual(yield* service.refresh, ModelManifest.BUNDLED_MODEL_MANIFEST);
+      assert.deepStrictEqual(yield* service.current, ModelManifest.BUNDLED_MODEL_MANIFEST);
+
+      remote = { ...REMOTE_MANIFEST, updatedAt: REMOTE_UPDATED_AT };
+      assert.deepStrictEqual(yield* service.forceRefresh, REMOTE_MANIFEST);
+      remote = { ...REMOTE_MANIFEST, updatedAt: ModelManifest.BUNDLED_MODEL_MANIFEST.updatedAt! };
+      assert.deepStrictEqual(yield* service.forceRefresh, REMOTE_MANIFEST);
+      const rebooted = yield* ModelManifest.make;
+      assert.deepStrictEqual(yield* rebooted.current, REMOTE_MANIFEST);
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
+          prefix: "model-manifest-stale-fetch-test",
+          response: () => Response.json(remote),
+        }),
+      ),
+    );
+  });
+
+  it.live("keeps the bundled manifest when the remote payload is malformed", () =>
+    Effect.gen(function* () {
+      const service = yield* ModelManifest.make;
+      assert.deepStrictEqual(yield* service.refresh, ModelManifest.BUNDLED_MODEL_MANIFEST);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        layerService({
           prefix: "model-manifest-malformed-test",
           response: () => Response.json({ version: 999, nonsense: true }),
         }),
@@ -315,7 +377,7 @@ describe("ModelManifest service", () => {
     const responses = [REMOTE_CLAUDE_MANIFEST, ...INVALID_REMOTE_MANIFESTS];
 
     return Effect.gen(function* () {
-      const service = yield* make;
+      const service = yield* ModelManifest.make;
       assert.deepStrictEqual(yield* service.refresh, REMOTE_CLAUDE_MANIFEST);
 
       for (const _invalid of INVALID_REMOTE_MANIFESTS) {
@@ -324,12 +386,12 @@ describe("ModelManifest service", () => {
         assert.deepStrictEqual(yield* service.refresh, REMOTE_CLAUDE_MANIFEST);
       }
 
-      const rebooted = yield* make;
+      const rebooted = yield* ModelManifest.make;
       assert.deepStrictEqual(yield* rebooted.current, REMOTE_CLAUDE_MANIFEST);
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
           prefix: "model-manifest-last-good-test",
           response: () => Response.json(responses[responseIndex]),
         }),
@@ -337,28 +399,105 @@ describe("ModelManifest service", () => {
     );
   });
 
+  it.live("drops a disk cache of a manifest older than the bundled one", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const config = yield* ServerConfig.ServerConfig;
+      const cachePath = path.join(config.stateDir, "model-manifest.json");
+      const { updatedAt: _undated, ...undatedManifest } = REMOTE_MANIFEST;
+      for (const stale of [
+        undatedManifest,
+        { ...REMOTE_MANIFEST, updatedAt: "2000-01-01T00:00:00Z" },
+      ]) {
+        yield* fs.writeFileString(
+          cachePath,
+          yield* ModelManifest.encodeManifestCache({ fetchedAtMs: 0, manifest: stale }),
+        );
+        const service = yield* ModelManifest.make;
+        assert.deepStrictEqual(yield* service.current, ModelManifest.BUNDLED_MODEL_MANIFEST);
+      }
+
+      yield* fs.writeFileString(
+        cachePath,
+        yield* ModelManifest.encodeManifestCache({ fetchedAtMs: 0, manifest: REMOTE_MANIFEST }),
+      );
+      const later = yield* ModelManifest.make;
+      assert.deepStrictEqual(yield* later.current, REMOTE_MANIFEST);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        layerService({
+          prefix: "model-manifest-newer-bundle-test",
+          response: () => Response.json(REMOTE_MANIFEST),
+        }),
+      ),
+    ),
+  );
+
   it.live("does not fetch when provider update checks are disabled", () =>
     Effect.gen(function* () {
       let fetchCount = 0;
-      const service = yield* make.pipe(
+      const service = yield* ModelManifest.make.pipe(
         Effect.provide(
-          httpClientLayer(() => {
+          layerHttpClient(() => {
             fetchCount += 1;
             return Response.json(REMOTE_MANIFEST);
           }),
         ),
       );
-      assert.deepStrictEqual(yield* service.refresh, BUNDLED_MODEL_MANIFEST);
+      assert.deepStrictEqual(yield* service.refresh, ModelManifest.BUNDLED_MODEL_MANIFEST);
+      assert.deepStrictEqual(yield* service.forceRefresh, ModelManifest.BUNDLED_MODEL_MANIFEST);
       assert.strictEqual(fetchCount, 0);
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        serviceLayers({
+        layerService({
           prefix: "model-manifest-optout-test",
           response: () => Response.json(REMOTE_MANIFEST),
           settings: { enableProviderUpdateChecks: false },
         }),
       ),
+    ),
+  );
+});
+
+it.effect("caches valid compatibility policies and keeps them after a malformed refresh", () => {
+  const remote: ModelManifest.ModelManifestData = {
+    ...REMOTE_MANIFEST,
+    compatibility: [
+      {
+        driver: "codex",
+        t3CodeRange: ">=0.0.42",
+        recommendedVersion: "2.0.0",
+        ranges: [{ range: "=2.0.0", status: "supported" }],
+      },
+    ],
+  };
+  let invalid = false;
+  return Effect.gen(function* () {
+    const service = yield* ModelManifest.make;
+    assert.deepStrictEqual((yield* service.refresh).compatibility, remote.compatibility);
+    invalid = true;
+    yield* TestClock.adjust("1 hour");
+    assert.deepStrictEqual((yield* service.refresh).compatibility, remote.compatibility);
+    const rebooted = yield* ModelManifest.make;
+    assert.deepStrictEqual((yield* rebooted.current).compatibility, remote.compatibility);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      layerService({
+        prefix: "model-manifest-compatibility-test",
+        response: () =>
+          Response.json(
+            invalid
+              ? {
+                  ...remote,
+                  compatibility: [{ ...remote.compatibility![0], recommendedVersion: "3.0.0" }],
+                }
+              : remote,
+          ),
+      }),
     ),
   );
 });

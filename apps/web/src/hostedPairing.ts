@@ -40,8 +40,7 @@ export function isHostedStaticApp(url?: URL): boolean {
     return true;
   }
 
-  // No window (tests, static render) means no origin to be hosted at.
-  if (url === undefined && typeof window === "undefined") {
+  if (url === undefined && (typeof window === "undefined" || window.location === undefined)) {
     return false;
   }
 

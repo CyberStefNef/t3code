@@ -1,13 +1,79 @@
 import { describe, expect, it } from "@effect/vitest";
+import { EnvironmentNotRegisteredError } from "@t3tools/client-runtime/connection";
+import { isTransportConnectionErrorMessage } from "@t3tools/client-runtime/errors";
+import { EnvironmentRpcUnavailableError } from "@t3tools/client-runtime/rpc";
 import {
   CommandId,
+  ComposerContextId,
+  EnvironmentAuthorizationError,
   EnvironmentId,
   MessageId,
+  OrchestrationDispatchCommandError,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
-import { AtomRegistry } from "effect/unstable/reactivity";
+import { AtomRegistry } from "effect/reactivity";
+import * as RpcClientError from "effect/rpc/RpcClientError";
+import * as Socket from "effect/socket/Socket";
+import { onTestFinished, vi } from "vite-plus/test";
+
+const outboxFiles = vi.hoisted(() => new Map<string, string | Error>());
+
+vi.mock("expo-file-system", () => {
+  class Directory {
+    create() {}
+
+    list() {
+      return Array.from(outboxFiles.keys(), (name) => new File(name));
+    }
+  }
+
+  class File {
+    readonly name: string;
+    readonly parentDirectory = new Directory();
+
+    constructor(...parts: [string] | [Directory, string]) {
+      this.name = parts.length === 1 ? parts[0] : parts[1];
+    }
+
+    get exists() {
+      return outboxFiles.has(this.name);
+    }
+
+    create() {
+      outboxFiles.set(this.name, "");
+    }
+
+    write(contents: string) {
+      outboxFiles.set(this.name, contents);
+    }
+
+    moveSync(file: File) {
+      const contents = outboxFiles.get(this.name);
+      if (contents === undefined) throw new Error("Missing file");
+      outboxFiles.set(file.name, contents);
+      outboxFiles.delete(this.name);
+    }
+
+    delete() {
+      outboxFiles.delete(this.name);
+    }
+
+    async text(): Promise<string> {
+      const contents = outboxFiles.get(this.name);
+      if (contents instanceof Error) throw contents;
+      if (contents === undefined) throw new Error("Missing file");
+      return contents;
+    }
+  }
+
+  return {
+    File,
+    Directory,
+    Paths: { document: "/documents" },
+  };
+});
 
 import {
   decodeQueuedThreadMessage,
@@ -24,7 +90,12 @@ import {
   type QueuedThreadMessage,
 } from "./thread-outbox-model";
 import { createThreadOutboxManager, ThreadOutboxManagerError } from "./thread-outbox-manager";
-import type { ThreadOutboxStorage } from "./thread-outbox-storage";
+import {
+  expoThreadOutboxStorage,
+  ThreadOutboxStorageError,
+  type ThreadOutboxLoadResult,
+  type ThreadOutboxStorage,
+} from "./thread-outbox-storage";
 
 function queuedMessage(input: {
   readonly environmentId?: string;
@@ -44,6 +115,194 @@ function queuedMessage(input: {
 }
 
 describe("thread outbox", () => {
+  it("retains structured context through a persisted offline queue round trip", () => {
+    const message: QueuedThreadMessage = {
+      ...queuedMessage({ messageId: "context-message", createdAt: "2026-09-06T12:00:00.000Z" }),
+      text: "[Build](t3-context://v1/terminal/build-output)",
+      context: {
+        version: 1,
+        records: [
+          {
+            version: 1,
+            kind: "terminal",
+            contextId: ComposerContextId.make("build-output"),
+            label: "Build",
+            terminalId: "main",
+            terminalLabel: "Terminal",
+            lineStart: 2,
+            lineEnd: 2,
+            text: "Build failed",
+          },
+        ],
+      },
+    };
+    expect(
+      decodeQueuedThreadMessage(JSON.parse(JSON.stringify(encodeQueuedThreadMessage(message)))),
+    ).toEqual(message);
+  });
+  it("retains queue mode when a queued provider switch reloads from storage", () => {
+    const message: QueuedThreadMessage = {
+      ...queuedMessage({ messageId: "queued-switch", createdAt: "2026-09-17T09:00:00.000Z" }),
+      dispatchMode: "queue",
+    };
+    expect(
+      decodeQueuedThreadMessage(JSON.parse(JSON.stringify(encodeQueuedThreadMessage(message)))),
+    ).toEqual(message);
+  });
+  it.each(["read", "json", "schema"] as const)(
+    "recovers usable messages without permitting cleanup after a record %s failure",
+    async (failure) => {
+      onTestFinished(() => outboxFiles.clear());
+      const first = queuedMessage({
+        messageId: "message-1",
+        createdAt: "2026-06-08T10:00:01.000Z",
+      });
+      const second = queuedMessage({
+        environmentId: "environment-2",
+        messageId: "message-2",
+        createdAt: "2026-06-08T10:00:02.000Z",
+      });
+      outboxFiles.set(
+        "message-2.json",
+        failure === "read"
+          ? new Error("storage unavailable")
+          : failure === "json"
+            ? "{"
+            : JSON.stringify({ ...second, schemaVersion: 999 }),
+      );
+      outboxFiles.set("message-1.json", JSON.stringify(encodeQueuedThreadMessage(first)));
+      const unreadable = outboxFiles.get("message-2.json");
+
+      await expect(expoThreadOutboxStorage.load()).resolves.toMatchObject({
+        messages: [first],
+        errors: [{ operation: "read-message", fileName: "message-2.json" }],
+      });
+
+      const registry = AtomRegistry.make();
+      onTestFinished(() => registry.dispose());
+      const manager = createThreadOutboxManager({
+        registry,
+        storage: expoThreadOutboxStorage,
+        warn: () => {},
+      });
+      await expect(manager.load()).resolves.toBe(false);
+      const recovered = registry.get(manager.queuedMessagesByThreadKeyAtom)[
+        "environment-1:thread-1"
+      ]![0]!;
+      expect(recovered).toEqual(first);
+      await expect(manager.confirmQueued(recovered)).resolves.toBe(true);
+      const edited = { ...recovered, text: "Edited after recovery" };
+      await expect(manager.update(edited)).resolves.toBe(true);
+      const beforeRetry = registry.get(manager.queuedMessagesByThreadKeyAtom);
+      await expect(manager.load()).resolves.toBe(false);
+      expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toBe(beforeRetry);
+      await expect(manager.clearEnvironment(first.environmentId)).rejects.toMatchObject({
+        operation: "clear-environment-load",
+      });
+      expect(outboxFiles.get("message-2.json")).toBe(unreadable);
+      expect(outboxFiles.has("message-1.json")).toBe(true);
+
+      await expect(manager.remove(edited)).resolves.toBe(edited);
+      expect(outboxFiles.has("message-1.json")).toBe(false);
+
+      outboxFiles.set("message-2.json", JSON.stringify(encodeQueuedThreadMessage(second)));
+      await expect(manager.load()).resolves.toBe(true);
+      expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
+        "environment-2:thread-1": [second],
+      });
+      await expect(expoThreadOutboxStorage.load()).resolves.toEqual({
+        messages: [second],
+        errors: [],
+      });
+    },
+  );
+
+  it("preserves queued messages when environment cleanup cannot read the outbox", async () => {
+    const registry = AtomRegistry.make();
+    onTestFinished(() => registry.dispose());
+    const message = queuedMessage({
+      messageId: "message-1",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    const stored = new Map<MessageId, QueuedThreadMessage>();
+    const manager = createThreadOutboxManager({
+      registry,
+      warn: () => {},
+      storage: {
+        load: async () => {
+          throw new Error("storage unavailable");
+        },
+        write: async (entry) => {
+          stored.set(entry.messageId, entry);
+        },
+        remove: async (entry) => {
+          stored.delete(entry.messageId);
+        },
+      },
+    });
+    await manager.enqueue(message);
+
+    await expect(manager.clearEnvironment(message.environmentId)).rejects.toMatchObject({
+      operation: "clear-environment-load",
+    });
+    expect([...stored.values()]).toEqual([message]);
+    expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
+      "environment-1:thread-1": [message],
+    });
+  });
+
+  it("keeps in-session edits and removals when an incomplete load is retried", async () => {
+    const registry = AtomRegistry.make();
+    onTestFinished(() => registry.dispose());
+    const message = queuedMessage({
+      messageId: "message-retried",
+      createdAt: "2026-06-08T10:00:01.000Z",
+    });
+    const started = Promise.withResolvers<void>();
+    const response = Promise.withResolvers<ThreadOutboxLoadResult>();
+    const load = vi.fn<ThreadOutboxStorage["load"]>(async () => ({
+      messages: [message],
+      errors: [],
+    }));
+    load.mockImplementationOnce(() => {
+      started.resolve();
+      return response.promise;
+    });
+    const manager = createThreadOutboxManager({
+      registry,
+      storage: { load, write: async () => {}, remove: async () => {} },
+      warn: () => {},
+    });
+    const loading = manager.load();
+    await started.promise;
+    const edited = { ...message, text: "Accepted while storage was being read" };
+    const writing = manager.enqueue(edited);
+    response.resolve({
+      messages: [message],
+      errors: [
+        new ThreadOutboxStorageError({
+          operation: "read-message",
+          environmentId: null,
+          threadId: null,
+          messageId: null,
+          fileName: "unreadable.json",
+          cause: new Error("unreadable record"),
+        }),
+      ],
+    });
+    await expect(loading).resolves.toBe(false);
+    await writing;
+    expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
+      "environment-1:thread-1": [edited],
+    });
+    await expect(manager.confirmQueued(edited)).resolves.toBe(true);
+
+    await manager.remove(edited);
+    await expect(manager.load()).resolves.toBe(true);
+    expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({});
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
   it("groups messages by scoped thread and preserves creation order", () => {
     const later = queuedMessage({
       messageId: "message-2",
@@ -102,6 +361,30 @@ describe("thread outbox", () => {
     expect(decodeQueuedThreadMessage(encodeQueuedThreadMessage(message))).toEqual(message);
   });
 
+  it("reads file-backed images from v4 queued messages", () => {
+    const message = {
+      ...queuedMessage({
+        messageId: "message-image",
+        createdAt: "2026-06-08T10:00:01.000Z",
+      }),
+      attachments: [
+        {
+          id: "image-1",
+          type: "image" as const,
+          name: "photo.png",
+          mimeType: "image/png",
+          sizeBytes: 3,
+          fileUri: "file:///documents/t3-composer-attachments/photo.png",
+          previewUri: "file:///documents/t3-composer-attachments/photo.png",
+          uploadedAttachmentId: "pending-photo-png",
+          uploadEnvironmentId: EnvironmentId.make("environment-1"),
+        },
+      ],
+    } satisfies QueuedThreadMessage;
+
+    expect(decodeQueuedThreadMessage({ ...message, schemaVersion: 4 })).toEqual(message);
+  });
+
   it("persists the exact selector snapshot while remaining compatible with v1 messages", () => {
     const legacyMessage = queuedMessage({
       messageId: "message-1",
@@ -150,6 +433,62 @@ describe("thread outbox", () => {
     ).toBe(false);
   });
 
+  it("normalizes queued plan mode against the queued provider, not the current thread", () => {
+    const codex = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.6-sol" };
+    const antigravity = {
+      instanceId: ProviderInstanceId.make("google-personal"),
+      model: "gemini-test-thinking",
+      options: [{ id: "native-option", value: "keep-this-choice" }],
+    };
+    const providers = [
+      { instanceId: codex.instanceId, showInteractionModeToggle: true },
+      { instanceId: antigravity.instanceId, showInteractionModeToggle: false },
+    ];
+    const message = {
+      ...queuedMessage({ messageId: "queued-plan", createdAt: "2026-09-02T10:00:00.000Z" }),
+      text: "/plan inspect the project",
+      modelSelection: antigravity,
+      interactionMode: "plan",
+    } satisfies QueuedThreadMessage;
+
+    expect(
+      resolveQueuedThreadSettings(
+        message,
+        { modelSelection: codex, runtimeMode: "approval-required", interactionMode: "plan" },
+        providers,
+      ),
+    ).toEqual({
+      modelSelection: antigravity,
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+    });
+    expect(
+      resolveQueuedThreadSettings(
+        { ...message, modelSelection: codex },
+        {
+          modelSelection: antigravity,
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+        },
+        providers,
+      ).interactionMode,
+    ).toBe("plan");
+  });
+
+  it("normalizes a legacy queued message that inherits unsupported plan mode", () => {
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("google-personal"),
+      model: "gemini-test-thinking",
+    };
+    expect(
+      resolveQueuedThreadSettings(
+        queuedMessage({ messageId: "legacy-plan", createdAt: "2026-09-02T10:00:00.000Z" }),
+        { modelSelection, runtimeMode: "approval-required", interactionMode: "plan" },
+        [{ instanceId: modelSelection.instanceId, showInteractionModeToggle: false }],
+      ).interactionMode,
+    ).toBe("default");
+  });
+
   it("backs off queued delivery retries and caps them at sixteen seconds", () => {
     expect([1, 2, 3, 4, 5, 6].map(threadOutboxRetryDelayMs)).toEqual([
       1_000, 2_000, 4_000, 8_000, 16_000, 16_000,
@@ -161,7 +500,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [],
+        load: async () => ({ messages: [], errors: [] }),
         write: async () => undefined,
         remove: async () => undefined,
       },
@@ -208,7 +547,7 @@ describe("thread outbox", () => {
         if (loadCalls === 1) {
           await initialLoadBlocked;
         }
-        return [...stored.values()];
+        return { messages: [...stored.values()], errors: [] };
       },
       write: async () => undefined,
       remove: async (candidate) => {
@@ -244,7 +583,7 @@ describe("thread outbox", () => {
         load: async () => {
           loadCalls += 1;
           if (loadCalls === 1) throw loadCause;
-          return [];
+          return { messages: [], errors: [] };
         },
         write: async () => undefined,
         remove: async () => undefined,
@@ -277,7 +616,7 @@ describe("thread outbox", () => {
     const removalCause = new Error("remove failed");
     let failRemoval = true;
     const storage: ThreadOutboxStorage = {
-      load: async () => [...stored.values()],
+      load: async () => ({ messages: [...stored.values()], errors: [] }),
       write: async (message) => {
         stored.set(message.messageId, message);
       },
@@ -327,7 +666,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [],
+        load: async () => ({ messages: [], errors: [] }),
         write: async () => writeBlocked,
         remove: async () => undefined,
       },
@@ -356,7 +695,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [],
+        load: async () => ({ messages: [], errors: [] }),
         write: async () => {
           throw writeCause;
         },
@@ -387,7 +726,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [],
+        load: async () => ({ messages: [], errors: [] }),
         write: async () => {
           throw new Error("disk full");
         },
@@ -401,9 +740,6 @@ describe("thread outbox", () => {
       createdAt: "2026-06-08T10:00:01.000Z",
     });
 
-    // A concurrent update losing its race can compensate-write this payload
-    // to disk before this write fails; rollback must clear that copy or a
-    // restart resurrects the message.
     await expect(manager.enqueue(message)).rejects.toBeInstanceOf(ThreadOutboxManagerError);
     expect(removed).toEqual(["message-1"]);
     registry.dispose();
@@ -419,7 +755,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [],
+        load: async () => ({ messages: [], errors: [] }),
         write: async () => {
           if (failNextWrite) {
             failNextWrite = false;
@@ -442,7 +778,6 @@ describe("thread outbox", () => {
     await expect(first).rejects.toBeInstanceOf(ThreadOutboxManagerError);
     await second;
 
-    // The failed first attempt must not roll back the retry that replaced it.
     expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
       "environment-1:thread-1": [retried],
     });
@@ -456,7 +791,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [],
+        load: async () => ({ messages: [], errors: [] }),
         write: async () => undefined,
         remove: async () => undefined,
       },
@@ -480,7 +815,7 @@ describe("thread outbox", () => {
     const registry = AtomRegistry.make();
     const stored = new Map<MessageId, QueuedThreadMessage>();
     const storage: ThreadOutboxStorage = {
-      load: async () => [...stored.values()],
+      load: async () => ({ messages: [...stored.values()], errors: [] }),
       write: async (message) => {
         stored.set(message.messageId, message);
       },
@@ -515,7 +850,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [],
+        load: async () => ({ messages: [], errors: [] }),
         write: async (message) => {
           writes.push(message.text);
         },
@@ -529,15 +864,12 @@ describe("thread outbox", () => {
     const edited = { ...original, text: "keep my changes" };
 
     await manager.enqueue(original);
-    // Revision captured before slow work (an attachment upload) starts.
     const revision = manager.revisionOf(original.messageId);
     await manager.update(edited);
 
     await expect(manager.update({ ...original, text: "stale upload" }, revision)).resolves.toBe(
       false,
     );
-    // The losing writer was rejected before persisting: no stale payload can
-    // sit on disk waiting to resurrect on the next load.
     expect(writes).toEqual([original.text, "keep my changes"]);
     expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
       "environment-1:thread-1": [edited],
@@ -559,7 +891,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [],
+        load: async () => ({ messages: [], errors: [] }),
         write: async (message) => {
           writes.push(message.text);
           if (message.text === "stale upload") {
@@ -586,9 +918,6 @@ describe("thread outbox", () => {
     resumeWrite();
 
     await expect(update).resolves.toBe(false);
-    // The losing update re-writes the winning payload inside its own
-    // mutation, before the replacement's serialized write lands, so a crash
-    // between the two cannot leave the stale payload on disk.
     expect(writes).toEqual([original.text, "stale upload", "newer edit", "newer edit"]);
     await enqueue;
     expect(registry.get(manager.queuedMessagesByThreadKeyAtom)).toEqual({
@@ -603,7 +932,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [...stored.values()],
+        load: async () => ({ messages: [...stored.values()], errors: [] }),
         write: async (message) => {
           stored.set(message.messageId, message);
         },
@@ -619,8 +948,6 @@ describe("thread outbox", () => {
     const edited = { ...original, text: "edited while restoring" };
 
     await manager.enqueue(original);
-    // Revision captured when restore-to-composer read the payload it intends
-    // to remove; the edit accepted afterwards must survive the removal.
     const revision = manager.revisionOf(original.messageId);
     await manager.update(edited);
 
@@ -652,7 +979,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [...stored.values()],
+        load: async () => ({ messages: [...stored.values()], errors: [] }),
         write: async (message) => {
           if (message === retried) {
             replacementWriteStarted.resolve();
@@ -675,13 +1002,10 @@ describe("thread outbox", () => {
       removalSettled = true;
     });
     await removeStarted.promise;
-    // Published synchronously while the durable remove is still in flight.
     const enqueue = manager.enqueue(retried);
     removeBarrier.resolve();
     await replacementWriteStarted.promise;
 
-    // The canceled removal itself restores the durable winner. The queued
-    // enqueue write has not had a chance to run yet.
     expect(removalSettled).toBe(false);
     replacementWriteBarrier.resolve();
     await expect(removal).resolves.toBe(null);
@@ -702,7 +1026,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [...stored.values()],
+        load: async () => ({ messages: [...stored.values()], errors: [] }),
         write: async (message) => {
           stored.set(message.messageId, message);
         },
@@ -741,7 +1065,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [...stored.values()],
+        load: async () => ({ messages: [...stored.values()], errors: [] }),
         write: async (message) => {
           stored.set(message.messageId, message);
         },
@@ -805,7 +1129,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [...stored.values()],
+        load: async () => ({ messages: [...stored.values()], errors: [] }),
         write: async (message) => {
           stored.set(message.messageId, message);
         },
@@ -848,7 +1172,7 @@ describe("thread outbox", () => {
     const manager = createThreadOutboxManager({
       registry,
       storage: {
-        load: async () => [...stored.values()],
+        load: async () => ({ messages: [...stored.values()], errors: [] }),
         write: async (message) => {
           stored.set(message.messageId, message);
         },
@@ -883,10 +1207,6 @@ describe("thread outbox", () => {
   });
 
   it("removes an already-created pending task before the file-capability gate runs", () => {
-    // The creation's startTurn already made the thread, so the resolver wants
-    // the queued message removed. A missing server config (or missing file
-    // support) must not turn that into a restore, which would duplicate the
-    // task as a draft.
     const fileAttachments = [{ name: "report.pdf", sizeBytes: 42 }];
     expect(
       resolveThreadOutboxDispatchStep({
@@ -938,12 +1258,19 @@ describe("thread outbox", () => {
     ).toEqual({ step: "send" });
   });
 
-  it("sends a message without file attachments before the server config loads", () => {
+  it("waits for provider capabilities before sending text-only queued messages", () => {
     expect(
       resolveThreadOutboxDispatchStep({
         deliveryAction: "send",
         fileAttachments: [],
         serverConfig: null,
+      }),
+    ).toEqual({ step: "retry" });
+    expect(
+      resolveThreadOutboxDispatchStep({
+        deliveryAction: "send",
+        fileAttachments: [],
+        serverConfig: { maxFileUploadBytes: undefined },
       }),
     ).toEqual({ step: "send" });
   });
@@ -1009,8 +1336,6 @@ describe("thread outbox", () => {
         threadBusy: false,
       }),
     ).toBe("wait");
-    // Connected but not yet synchronized: a previously delivered creation may
-    // simply not be visible yet — sending now could duplicate the thread.
     expect(
       resolveThreadOutboxDeliveryAction({
         isCreation: true,
@@ -1040,7 +1365,7 @@ describe("thread outbox", () => {
     ).toBe("remove");
   });
 
-  it("round-trips queued creations and gates incomplete ones from sending", () => {
+  it("round-trips queued PR checkout sources and gates incomplete creations from sending", () => {
     const base = queuedMessage({
       messageId: "message-1",
       createdAt: "2026-06-08T10:00:01.000Z",
@@ -1054,9 +1379,10 @@ describe("thread outbox", () => {
       creation: {
         projectId: ProjectId.make("project-1"),
         workspaceMode: "worktree",
-        branch: "main",
+        branch: "fork/feature",
         worktreePath: null,
-        startFromOrigin: true,
+        startFromOrigin: false,
+        pullRequestReference: "https://github.com/acme/repo/pull/123",
       },
     } satisfies QueuedThreadMessage;
 
@@ -1080,6 +1406,26 @@ describe("thread outbox", () => {
       false,
     );
     expect(isQueuedThreadCreationSendable(base)).toBe(false);
+    expect(isQueuedThreadCreationSendable({ ...creationMessage, text: "  " })).toBe(false);
+    expect(
+      isQueuedThreadCreationSendable({
+        ...creationMessage,
+        text: "",
+        attachments: [
+          {
+            id: "image-1",
+            type: "image",
+            name: "photo.png",
+            mimeType: "image/png",
+            sizeBytes: 3,
+            fileUri: "file:///documents/t3-composer-attachments/photo.png",
+            previewUri: "file:///documents/t3-composer-attachments/photo.png",
+            uploadedAttachmentId: "pending-photo-png",
+            uploadEnvironmentId: EnvironmentId.make("environment-1"),
+          },
+        ],
+      }),
+    ).toBe(true);
   });
 
   it("retries transport failures but drops deterministic command failures", () => {
@@ -1091,6 +1437,58 @@ describe("thread outbox", () => {
       }),
     ).toBe(true);
     expect(shouldRetryThreadOutboxDelivery(new Error("Thread no longer exists"))).toBe(false);
+    expect(
+      shouldRetryThreadOutboxDelivery(
+        new OrchestrationDispatchCommandError({ message: "Thread no longer exists" }),
+      ),
+    ).toBe(false);
+    expect(
+      shouldRetryThreadOutboxDelivery(
+        new EnvironmentAuthorizationError({
+          message: "Missing scope",
+          requiredScope: "orchestration:operate",
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("retries every in-flight transport failure by tag, not by message text", () => {
+    const socketReasons = [
+      new Socket.SocketReadError({ cause: new Error("The network connection was lost.") }),
+      new Socket.SocketWriteError({ cause: new Error("Broken pipe") }),
+      new Socket.SocketCloseError({ code: 1006 }),
+      new Socket.SocketOpenError({ kind: "Timeout", cause: new Error("timeout") }),
+    ];
+    for (const reason of socketReasons) {
+      const error = new RpcClientError.RpcClientError({ reason });
+      expect(isTransportConnectionErrorMessage(error.message)).toBe(
+        reason._tag === "SocketCloseError" || reason._tag === "SocketOpenError",
+      );
+      expect(shouldRetryThreadOutboxDelivery(error)).toBe(true);
+    }
+    expect(
+      shouldRetryThreadOutboxDelivery(
+        new RpcClientError.RpcClientError({
+          reason: new RpcClientError.RpcClientDefect({
+            message: "Error decoding message",
+            cause: new Error("Unexpected end of JSON input"),
+          }),
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      shouldRetryThreadOutboxDelivery(
+        new EnvironmentRpcUnavailableError({
+          environmentId: "environment-1",
+          message: "Home is not connected.",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      shouldRetryThreadOutboxDelivery(
+        new EnvironmentNotRegisteredError({ environmentId: EnvironmentId.make("environment-1") }),
+      ),
+    ).toBe(true);
   });
 
   it("retains queued messages when settings synchronization fails before startTurn", () => {

@@ -9,7 +9,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
-import { writeFileStringAtomically } from "../atomicWrite.ts";
+import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
 
 const decodeProviderStatusCache = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ServerProviderSchema),
@@ -29,13 +29,28 @@ const mergeProviderModels = (
   ];
 };
 
+const BUILT_IN_DRIVER_ORDER: ReadonlyArray<string> = [
+  "codex",
+  "claudeAgent",
+  "cursor",
+  "grok",
+  "opencode",
+  "antigravity",
+];
+
+const driverRank = (driver: string): number => {
+  const index = BUILT_IN_DRIVER_ORDER.indexOf(driver);
+  return index === -1 ? BUILT_IN_DRIVER_ORDER.length : index;
+};
+
 export const orderProviderSnapshots = (
   providers: ReadonlyArray<ServerProvider>,
 ): ReadonlyArray<ServerProvider> =>
   [...providers].toSorted(
     (left, right) =>
-      (left.displayName ?? "").localeCompare(right.displayName ?? "") ||
+      driverRank(left.driver) - driverRank(right.driver) ||
       left.driver.localeCompare(right.driver) ||
+      (left.displayName ?? "").localeCompare(right.displayName ?? "") ||
       left.instanceId.localeCompare(right.instanceId),
   );
 
@@ -80,16 +95,6 @@ export const hydrateCachedProvider = (input: {
 };
 
 /**
- * Resolve the on-disk cache path for a provider instance snapshot.
- *
- * File naming: `<cacheDir>/<instanceId>.json`. For the default instance of
- * a built-in kind this equals the legacy `<kind>.json` path (because
- * `defaultInstanceIdForDriver(kind).toString() === kind`), so existing
- * cached snapshots remain readable without any rename step.
- *
- * Non-default instances (e.g. `codex_personal`) land in their own files and
- * never collide with other instances.
- *
  * Cache contents must still carry matching `instanceId` + `driver` identity
  * before hydration. The filename alone is not trusted as a routing key.
  */

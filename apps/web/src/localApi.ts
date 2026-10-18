@@ -29,6 +29,15 @@ function createBrowserLocalApi(): LocalApi {
 
         window.open(url, "_blank", "noopener,noreferrer");
       },
+      openSystemSettings: async (pane) => {
+        if (!window.desktopBridge?.openSystemSettings) {
+          throw new Error("Unable to open System Settings.");
+        }
+        const opened = await window.desktopBridge.openSystemSettings(pane);
+        if (!opened) {
+          throw new Error("Unable to open System Settings.");
+        }
+      },
     },
     contextMenu: {
       show: async <T extends string>(

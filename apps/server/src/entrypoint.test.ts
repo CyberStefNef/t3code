@@ -7,12 +7,12 @@ import * as NodeURL from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 
 import { isEntrypoint } from "./entrypoint.ts";
+import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 
 const makeTempDir = () => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-entrypoint-test-"));
 
 describe("isEntrypoint", () => {
   it("uses the runtime answer when Node provides one", () => {
-    // Node 22.18+ and 24.2+ populate `import.meta.main`; nothing else is consulted.
     expect(
       isEntrypoint({
         moduleUrl: "file:///somewhere/bin.mjs",
@@ -44,24 +44,28 @@ describe("isEntrypoint", () => {
     ).toBe(true);
   });
 
-  it("matches through a symlinked entrypoint, as npm and npx install it", () => {
-    const dir = makeTempDir();
-    const real = NodePath.join(dir, "bin.mjs");
-    const link = NodePath.join(dir, "t3");
-    NodeFS.writeFileSync(real, "");
-    NodeFS.symlinkSync(real, link);
+  it.skipIf(!symlinksSupported)(
+    "matches through a symlinked entrypoint, as npm and npx install it",
+    () => {
+      const dir = makeTempDir();
+      const real = NodePath.join(dir, "bin.mjs");
+      const link = NodePath.join(dir, "t3");
+      NodeFS.writeFileSync(real, "");
+      NodeFS.symlinkSync(real, link);
 
-    expect(
-      isEntrypoint({
-        moduleUrl: NodeURL.pathToFileURL(real).href,
-        entryPath: link,
-        runtimeMain: undefined,
-      }),
-    ).toBe(true);
-  });
+      // Node resolves the module URL to the real path, and on macOS the temp
+      // directory itself sits behind a symlink (`/var` -> `/private/var`).
+      expect(
+        isEntrypoint({
+          moduleUrl: NodeURL.pathToFileURL(NodeFS.realpathSync(real)).href,
+          entryPath: link,
+          runtimeMain: undefined,
+        }),
+      ).toBe(true);
+    },
+  );
 
   it("stays false for an imported module that is not the entrypoint", () => {
-    // This is what keeps `bin.test.ts` from launching the CLI on import.
     const dir = makeTempDir();
     const entry = NodePath.join(dir, "bin.mjs");
     const imported = NodePath.join(dir, "cli.mjs");

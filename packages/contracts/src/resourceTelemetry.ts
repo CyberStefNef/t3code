@@ -4,7 +4,16 @@ import { NonNegativeInt, PositiveInt, TrimmedNonEmptyString } from "./baseSchema
 import { HostPowerSnapshot } from "./background.ts";
 import { DesktopUpdateStateSchema } from "./ipc.ts";
 
-export const RESOURCE_MONITOR_PROTOCOL_VERSION = 2 as const;
+export const RESOURCE_MONITOR_PROTOCOL_VERSION = 3 as const;
+
+export const HostResourcesSnapshot = Schema.Struct({
+  sampledAt: NonNegativeInt,
+  cpuUtilization: Schema.NullOr(Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 1 }))),
+  cpuCount: NonNegativeInt,
+  availableMemoryBytes: NonNegativeInt,
+  totalMemoryBytes: NonNegativeInt,
+});
+export type HostResourcesSnapshot = typeof HostResourcesSnapshot.Type;
 
 export const ResourceTelemetryIoSemantics = Schema.Literals([
   "storage",
@@ -102,6 +111,13 @@ export const ResourceMonitorSampleNowCommand = Schema.Struct({
 });
 export type ResourceMonitorSampleNowCommand = typeof ResourceMonitorSampleNowCommand.Type;
 
+export const ResourceMonitorProcessTableCommand = Schema.Struct({
+  version: Schema.Literal(RESOURCE_MONITOR_PROTOCOL_VERSION),
+  type: Schema.Literal("processTable"),
+  requestId: TrimmedNonEmptyString,
+});
+export type ResourceMonitorProcessTableCommand = typeof ResourceMonitorProcessTableCommand.Type;
+
 export const ResourceMonitorSetSampleIntervalCommand = Schema.Struct({
   version: Schema.Literal(RESOURCE_MONITOR_PROTOCOL_VERSION),
   type: Schema.Literal("setSampleInterval"),
@@ -137,6 +153,7 @@ export const ResourceMonitorCommand = Schema.Union([
   ResourceMonitorSetSampleIntervalCommand,
   ResourceMonitorSetStreamingCommand,
   ResourceMonitorSampleNowCommand,
+  ResourceMonitorProcessTableCommand,
   ResourceMonitorReadHistoryCommand,
   ResourceMonitorShutdownCommand,
 ]);
@@ -168,6 +185,21 @@ export const ResourceMonitorSnapshotEvent = Schema.Struct({
 });
 export type ResourceMonitorSnapshotEvent = typeof ResourceMonitorSnapshotEvent.Type;
 
+export const ResourceMonitorProcessTableEntry = Schema.Struct({
+  pid: PositiveInt,
+  ppid: NonNegativeInt,
+  name: Schema.String,
+});
+export type ResourceMonitorProcessTableEntry = typeof ResourceMonitorProcessTableEntry.Type;
+
+export const ResourceMonitorProcessTableEvent = Schema.Struct({
+  version: Schema.Literal(RESOURCE_MONITOR_PROTOCOL_VERSION),
+  type: Schema.Literal("processTable"),
+  requestId: TrimmedNonEmptyString,
+  processes: Schema.Array(ResourceMonitorProcessTableEntry),
+});
+export type ResourceMonitorProcessTableEvent = typeof ResourceMonitorProcessTableEvent.Type;
+
 export const ResourceMonitorHistoryChunkEvent = Schema.Struct({
   version: Schema.Literal(RESOURCE_MONITOR_PROTOCOL_VERSION),
   type: Schema.Literal("historyChunk"),
@@ -189,6 +221,7 @@ export type ResourceMonitorErrorEvent = typeof ResourceMonitorErrorEvent.Type;
 export const ResourceMonitorEvent = Schema.Union([
   ResourceMonitorHelloEvent,
   ResourceMonitorSnapshotEvent,
+  ResourceMonitorProcessTableEvent,
   ResourceMonitorHistoryChunkEvent,
   ResourceMonitorErrorEvent,
 ]);
@@ -245,7 +278,6 @@ export const DesktopHostTelemetryHello = Schema.Struct({
 });
 export type DesktopHostTelemetryHello = typeof DesktopHostTelemetryHello.Type;
 
-/** Terminal marker for a server-triggered desktop update run. */
 export const DesktopUpdateRemoteOutcome = Schema.Literals([
   "ready-to-install",
   "up-to-date",
@@ -253,19 +285,10 @@ export const DesktopUpdateRemoteOutcome = Schema.Literals([
 ]);
 export type DesktopUpdateRemoteOutcome = typeof DesktopUpdateRemoteOutcome.Type;
 
-/**
- * Desktop main -> server: the desktop app's update state. Sent once when the
- * backend attaches and again on every state change, so the server always
- * knows whether the app on its machine can be updated and how a
- * server-triggered run is progressing.
- */
 export const DesktopUpdateStatusReport = Schema.Struct({
   version: Schema.Literal(1),
   type: Schema.Literal("desktopUpdateStatus"),
-  // Set while a server-triggered run owns the flow; absent for the attach
-  // snapshot and for locally driven update activity.
   requestId: Schema.optionalKey(TrimmedNonEmptyString),
-  // Terminal marker for a server-triggered run; absent while it is working.
   outcome: Schema.optionalKey(DesktopUpdateRemoteOutcome),
   reason: Schema.optionalKey(TrimmedNonEmptyString),
   state: DesktopUpdateStateSchema,

@@ -1,35 +1,67 @@
 import { useAtomValue } from "@effect/atom-react";
+import { resolveFilesystemReadAccess } from "@t3tools/client-runtime/state/filesystem";
 import {
-  type AssetUrlState,
   assetUrlStateFromResult,
+  blockedAssetUrlState,
   createAssetEnvironmentAtoms,
+  createProjectFaviconUrlAtomFamily,
   EMPTY_ASSET_URL_ATOM,
 } from "@t3tools/client-runtime/state/assets";
 import type { AssetResource, EnvironmentId } from "@t3tools/contracts";
 import { useCallback } from "react";
 
 import { connectionAtomRuntime } from "../connection/runtime";
-import { usePreparedConnection } from "./session";
+import { projectFaviconDatabaseCache } from "../lib/projectFaviconDatabaseCache";
+import { type AssetUrlState, deriveAssetUrlState } from "./asset-url-state";
+import { environmentProjectCloneListAtom } from "./projectClones";
+import { environmentSession, usePreparedConnection } from "./session";
+import { useEnvironmentPresentation } from "./presentation";
+import { useEnvironmentQuery } from "./query";
 import { useAtomQueryRunner } from "./use-atom-query-runner";
 
-export type { AssetUrlState } from "@t3tools/client-runtime/state/assets";
+export type { AssetUrlFailureReason, AssetUrlState } from "./asset-url-state";
 
 export const assetEnvironment = createAssetEnvironmentAtoms(connectionAtomRuntime);
+
+export const projectFaviconUrlAtom = createProjectFaviconUrlAtomFamily({
+  imageCache: projectFaviconDatabaseCache,
+  createUrl: assetEnvironment.createUrl,
+  preparedConnection: environmentSession.preparedConnectionValueAtom,
+  projectClones: environmentProjectCloneListAtom,
+});
 
 export function useAssetUrlState(
   environmentId: EnvironmentId | null,
   resource: AssetResource | null,
 ): AssetUrlState {
+  const fileAccessSession = useEnvironmentQuery(
+    environmentId === null ? null : environmentSession.sessionStateAtom(environmentId),
+  );
+  const fileEnvironment = useEnvironmentPresentation(environmentId);
+  const fileAccess = resolveFilesystemReadAccess({
+    isCatalogReady: fileEnvironment.isReady,
+    connection: fileEnvironment.presentation?.connection ?? null,
+    session: fileAccessSession.data,
+    sessionError: fileAccessSession.error,
+  });
+  const blocked = blockedAssetUrlState(resource, fileAccess);
   const preparedConnection = usePreparedConnection(environmentId);
+  const connectionPhase = fileEnvironment.presentation?.connection.phase ?? "available";
   const result = useAtomValue(
-    environmentId === null || resource === null
+    blocked !== null || environmentId === null || resource === null
       ? EMPTY_ASSET_URL_ATOM
       : assetEnvironment.createUrl({ environmentId, input: { resource } }),
   );
-  return assetUrlStateFromResult(
-    result,
-    preparedConnection._tag === "Some" ? preparedConnection.value.httpBaseUrl : null,
-  );
+  const shared =
+    blocked ??
+    assetUrlStateFromResult(
+      result,
+      preparedConnection._tag === "Some" ? preparedConnection.value.httpBaseUrl : null,
+    );
+  return deriveAssetUrlState({
+    connectionPhase,
+    shared: shared._tag === "Failure" && result.waiting ? { _tag: "Loading" } : shared,
+  });
 }
 
 export function useAssetUrl(

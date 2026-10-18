@@ -7,14 +7,14 @@ import type {
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom } from "effect/reactivity";
 
 import { previewBridge } from "~/components/preview/previewBridge";
 
 const PREVIEW_CONFIG_STALE_TIME_MS = 5 * 60_000;
 const PREVIEW_CONFIG_IDLE_TTL_MS = 10 * 60_000;
 
-export class PreviewWebviewBridgeUnavailableError extends Schema.TaggedErrorClass<PreviewWebviewBridgeUnavailableError>()(
+export class PreviewWebviewBridgeUnavailableError extends Schema.TaggedError<PreviewWebviewBridgeUnavailableError>()(
   "PreviewWebviewBridgeUnavailableError",
   { environmentId: Schema.String },
 ) {
@@ -23,7 +23,7 @@ export class PreviewWebviewBridgeUnavailableError extends Schema.TaggedErrorClas
   }
 }
 
-export class PreviewWebviewConfigLoadError extends Schema.TaggedErrorClass<PreviewWebviewConfigLoadError>()(
+export class PreviewWebviewConfigLoadError extends Schema.TaggedError<PreviewWebviewConfigLoadError>()(
   "PreviewWebviewConfigLoadError",
   {
     environmentId: Schema.String,
@@ -65,8 +65,7 @@ export const loadPreviewWebviewConfig = (
  *
  * The profile is the tail rather than a second field, so an id containing the
  * delimiter round-trips whole instead of being truncated into a different
- * profile's key. `BrowserProfileId` rejects control characters, which is what
- * makes the environment side of the split unambiguous.
+ * profile's key.
  */
 const CONFIG_KEY_DELIMITER = "\u0000";
 

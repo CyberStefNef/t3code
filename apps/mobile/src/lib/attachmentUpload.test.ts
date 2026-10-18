@@ -3,6 +3,7 @@ import * as Option from "effect/Option";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const mocks = vi.hoisted(() => ({
+  canOperate: true,
   documentUri: "file:///documents",
   createAssetUrl: vi.fn(),
   createUploadUrl: Symbol("create-upload-url"),
@@ -14,12 +15,10 @@ const mocks = vi.hoisted(() => ({
   upload: vi.fn(),
   writeFile: vi.fn(),
   deleteFile: vi.fn(),
+  readBase64: vi.fn(),
 }));
 
 vi.mock("@t3tools/client-runtime/state/runtime", () => ({
-  // The client-runtime attachments module resolves the same file through its
-  // relative import, so these fakes also feed runAttachmentUploadCycle and
-  // verifyPersistedAttachmentUpload.
   createEnvironmentRpcCommand: () => Symbol("rpc-command"),
   executeAtomQuery: mocks.executeAtomQuery,
   runAtomCommand: mocks.runAtomCommand,
@@ -28,6 +27,10 @@ vi.mock("@t3tools/client-runtime/state/runtime", () => ({
 
 vi.mock("../state/atom-registry", () => ({
   appAtomRegistry: { get: mocks.readAtom },
+}));
+
+vi.mock("./composerAttachmentPreviewRetention", () => ({
+  retainComposerAttachmentFileForPreview: () => () => {},
 }));
 
 vi.mock("../state/assets", () => ({
@@ -42,6 +45,7 @@ vi.mock("../state/attachments", () => ({
 }));
 
 vi.mock("../state/session", () => ({
+  readEnvironmentScope: () => mocks.canOperate,
   environmentSession: {
     preparedConnectionValueAtom: () => mocks.preparedConnection,
   },
@@ -66,6 +70,10 @@ vi.mock("expo-file-system", () => ({
     }
     delete() {
       mocks.deleteFile(this.uri);
+    }
+
+    async base64() {
+      return mocks.readBase64(this.uri);
     }
 
     upload(url: string, options: unknown) {
@@ -102,6 +110,16 @@ const image = {
   previewUri: "file:///images/screenshot.png",
 } as const satisfies DraftComposerAttachment;
 
+const fileBackedImage = {
+  id: "image-2",
+  type: "image",
+  name: "photo.png",
+  mimeType: "image/png",
+  sizeBytes: 3,
+  fileUri: "file:///documents/t3-composer-attachments/photo.png",
+  previewUri: "file:///documents/t3-composer-attachments/photo.png",
+} as const satisfies DraftComposerAttachment;
+
 const file = {
   id: "file-1",
   type: "file",
@@ -109,6 +127,15 @@ const file = {
   mimeType: "application/pdf",
   sizeBytes: 42,
   fileUri: "file:///documents/report.pdf",
+} as const satisfies DraftComposerAttachment;
+
+const documentPickedImage = {
+  id: "file-2",
+  type: "file",
+  name: "photo.png",
+  mimeType: "application/octet-stream",
+  sizeBytes: 3,
+  fileUri: "file:///documents/photo.png",
 } as const satisfies DraftComposerAttachment;
 
 describe("validateDraftFileAttachments", () => {
@@ -164,6 +191,7 @@ function removeCallsFor(attachmentId: string): number {
 
 describe("prepareTurnAttachments", () => {
   beforeEach(() => {
+    mocks.canOperate = true;
     mocks.documentUri = "file:///documents";
     mocks.createAssetUrl.mockReset();
     mocks.createAssetUrl.mockImplementation((target: unknown) => target);
@@ -174,6 +202,8 @@ describe("prepareTurnAttachments", () => {
     mocks.upload.mockReset();
     mocks.writeFile.mockReset();
     mocks.deleteFile.mockReset();
+    mocks.readBase64.mockReset();
+    mocks.readBase64.mockResolvedValue("YWJj");
     mocks.readAtom.mockReturnValue(Option.some({ httpBaseUrl: "https://environment.example/" }));
     mocks.runAtomCommand.mockImplementation(async (_registry: unknown, command: unknown) =>
       command === mocks.createUploadUrl
@@ -188,6 +218,80 @@ describe("prepareTurnAttachments", () => {
         : { _tag: "Success", value: undefined },
     );
     mocks.upload.mockResolvedValue({ status: 204, body: "", headers: {} });
+  });
+
+  it("does not mint or transfer attachments without task operation access", async () => {
+    mocks.canOperate = false;
+    await expect(
+      prepareTurnAttachments({
+        environmentId,
+        attachments: [fileBackedImage],
+        supportsImageUploads: true,
+      }),
+    ).rejects.toThrow("cannot upload attachments");
+    expect(mocks.runAtomCommand).not.toHaveBeenCalled();
+    expect(mocks.upload).not.toHaveBeenCalled();
+  });
+
+  it("rechecks access after a signed URL is minted before sending any bytes", async () => {
+    mocks.runAtomCommand.mockImplementationOnce(async () => {
+      mocks.canOperate = false;
+      return {
+        _tag: "Success",
+        value: {
+          attachmentId: MINTED_ID,
+          relativeUrl: "/api/attachments/upload/signed",
+          expiresAt: 1,
+        },
+      };
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(
+        prepareTurnAttachments({
+          environmentId,
+          attachments: [fileBackedImage],
+          supportsImageUploads: true,
+        }),
+      ).rejects.toThrow("cannot upload attachments");
+      expect(mocks.upload).not.toHaveBeenCalled();
+      expect(mocks.runAtomCommand).toHaveBeenCalledTimes(1);
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it("does not replace an expired upload when access was revoked during verification", async () => {
+    mocks.executeAtomQuery.mockImplementationOnce(async () => {
+      mocks.canOperate = false;
+      return { _tag: "Failure", error: { _tag: "AssetAttachmentNotFoundError" } };
+    });
+    await expect(
+      prepareTurnAttachments({
+        environmentId,
+        attachments: [
+          {
+            ...fileBackedImage,
+            uploadedAttachmentId: MINTED_ID,
+            uploadEnvironmentId: environmentId,
+          },
+        ],
+        supportsImageUploads: true,
+      }),
+    ).rejects.toThrow("cannot upload attachments");
+    expect(mocks.runAtomCommand).not.toHaveBeenCalled();
+    expect(mocks.upload).not.toHaveBeenCalled();
+  });
+
+  it("rechecks deletion permission before retrying a failed cleanup", async () => {
+    mocks.runAtomCommand.mockImplementationOnce(async () => {
+      mocks.canOperate = false;
+      return { _tag: "Failure", error: new Error("Retry cleanup") };
+    });
+    await expect(releasePendingAttachmentUploads(environmentId, [MINTED_ID])).rejects.toThrow(
+      "cannot delete pending attachments",
+    );
+    expect(mocks.runAtomCommand).toHaveBeenCalledTimes(1);
   });
 
   it("keeps existing image attachments on the legacy wire path", async () => {
@@ -208,8 +312,132 @@ describe("prepareTurnAttachments", () => {
     expect(mocks.upload).not.toHaveBeenCalled();
   });
 
+  it("inlines a file-backed image lazily when the server lacks image uploads", async () => {
+    const prepared = await prepareTurnAttachments({
+      environmentId,
+      attachments: [fileBackedImage],
+    });
+
+    expect(prepared.status).toBe("ready");
+    if (prepared.status !== "ready") return;
+    expect(prepared.attachments).toEqual([
+      {
+        type: "image",
+        name: "photo.png",
+        mimeType: "image/png",
+        sizeBytes: 3,
+        dataUrl: "data:image/png;base64,YWJj",
+      },
+    ]);
+    expect(mocks.readBase64).toHaveBeenCalledExactlyOnceWith(fileBackedImage.fileUri);
+    expect(mocks.upload).not.toHaveBeenCalled();
+  });
+
+  it("reads restored images from the current iOS document container for legacy sends", async () => {
+    const fileName = "33333333-3333-4333-8333-333333333333-photo.png";
+    mocks.documentUri =
+      "file:///var/mobile/Containers/Data/Application/22222222-2222-4222-8222-222222222222/Documents";
+    const oldUri = `file:///var/mobile/Containers/Data/Application/11111111-1111-4111-8111-111111111111/Documents/t3-composer-attachments/${fileName}`;
+    const prepared = await prepareTurnAttachments({
+      environmentId,
+      attachments: [{ ...fileBackedImage, fileUri: oldUri, previewUri: oldUri }],
+    });
+    expect(prepared.status).toBe("ready");
+    expect(mocks.readBase64).toHaveBeenCalledExactlyOnceWith(
+      `${mocks.documentUri}/t3-composer-attachments/${fileName}`,
+    );
+  });
+
+  it("rejects a legacy image without inline bytes or a file", async () => {
+    const { fileUri: _, ...missingImage } = fileBackedImage;
+    await expect(
+      prepareTurnAttachments({ environmentId, attachments: [missingImage] }),
+    ).rejects.toThrow("'photo.png' is no longer available. Attach the image again.");
+  });
+
+  it.each(["resolve", "reject"] as const)(
+    "abandons a canceled legacy image read that later %ss",
+    async (outcome) => {
+      const readStarted = Promise.withResolvers<void>();
+      const read = Promise.withResolvers<string>();
+      const controller = new AbortController();
+      mocks.readBase64.mockImplementation(() => {
+        readStarted.resolve();
+        return read.promise;
+      });
+      const preparing = prepareTurnAttachments({
+        environmentId,
+        attachments: [fileBackedImage],
+        signal: controller.signal,
+      });
+      await readStarted.promise;
+      controller.abort();
+      if (outcome === "resolve") read.resolve("YWJj");
+      else read.reject(new Error("Native read failed after cancellation"));
+
+      await expect(preparing).resolves.toEqual({ status: "abandoned" });
+    },
+  );
+
+  it("uploads a file-backed image from its owned copy without staging base64", async () => {
+    const prepared = await prepareTurnAttachments({
+      environmentId,
+      attachments: [fileBackedImage],
+      supportsImageUploads: true,
+    });
+
+    expect(mocks.upload).toHaveBeenCalledWith(
+      fileBackedImage.fileUri,
+      "https://environment.example/api/attachments/upload/signed",
+      expect.objectContaining({ headers: { "Content-Type": "image/png" } }),
+    );
+    expect(mocks.readBase64).not.toHaveBeenCalled();
+    expect(mocks.writeFile).not.toHaveBeenCalled();
+    expect(mocks.deleteFile).not.toHaveBeenCalled();
+    expect(prepared.status).toBe("ready");
+    if (prepared.status !== "ready") return;
+    expect(prepared.attachments).toEqual([
+      {
+        type: "image",
+        id: MINTED_ID,
+        name: "photo.png",
+        mimeType: "image/png",
+        sizeBytes: 3,
+      },
+    ]);
+  });
+
+  it("sends a document-picked picture with the mime it was uploaded under", async () => {
+    const prepared = await prepareTurnAttachments({
+      environmentId,
+      attachments: [documentPickedImage],
+    });
+
+    expect(mocks.upload).toHaveBeenCalledWith(
+      "file:///documents/photo.png",
+      "https://environment.example/api/attachments/upload/signed",
+      expect.objectContaining({ headers: { "Content-Type": "image/png" } }),
+    );
+    expect(prepared.status).toBe("ready");
+    if (prepared.status !== "ready") return;
+    expect(prepared.attachments[0]).toEqual({
+      type: "image",
+      id: MINTED_ID,
+      name: "photo.png",
+      mimeType: "image/png",
+      sizeBytes: 3,
+    });
+  });
+
   it("uploads generic file bytes directly and keeps mixed attachment order", async () => {
-    const prepared = await prepareTurnAttachments({ environmentId, attachments: [file, image] });
+    const pastedFile = {
+      ...file,
+      source: { _tag: "pasted-text" as const },
+    };
+    const prepared = await prepareTurnAttachments({
+      environmentId,
+      attachments: [pastedFile, image],
+    });
 
     expect(mocks.upload).toHaveBeenCalledWith(
       "file:///documents/report.pdf",
@@ -228,11 +456,12 @@ describe("prepareTurnAttachments", () => {
       name: "report.pdf",
       mimeType: "application/pdf",
       sizeBytes: 42,
+      source: { _tag: "pasted-text" },
     });
     expect(prepared.attachments[1]?.type).toBe("image");
     expect(prepared.pendingAttachmentIds).toEqual([MINTED_ID]);
     expect(prepared.draftAttachments[0]).toEqual({
-      ...file,
+      ...pastedFile,
       uploadedAttachmentId: MINTED_ID,
       uploadEnvironmentId: environmentId,
     });
@@ -310,6 +539,30 @@ describe("prepareTurnAttachments", () => {
         uploadEnvironmentId: environmentId,
       },
       image,
+    ]);
+  });
+
+  it("keeps the uploaded id when a document-picked picture uploads as an image", () => {
+    expect(
+      withUploadedMobileAttachmentReferences({
+        environmentId,
+        attachments: [documentPickedImage],
+        uploadedAttachments: [
+          {
+            type: "image",
+            id: "pending-promoted-png",
+            name: documentPickedImage.name,
+            mimeType: "image/png",
+            sizeBytes: documentPickedImage.sizeBytes,
+          },
+        ],
+      }),
+    ).toEqual([
+      {
+        ...documentPickedImage,
+        uploadedAttachmentId: "pending-promoted-png",
+        uploadEnvironmentId: environmentId,
+      },
     ]);
   });
 

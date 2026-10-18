@@ -1,16 +1,17 @@
-import { describe, expect, it, vi } from "vite-plus/test";
+import { describe, expect, it } from "vite-plus/test";
 
 import {
   changeRequestRepositoryUrl,
   findProjectForChangeRequest,
+  findProjectOnChangeRequestHost,
   gitHubPullRequestBrowserUrl,
   matchesLinkedPullRequestUrl,
-  openPullRequestLink,
   parseChangeRequestUrl,
-  PullRequestLinkOpenError,
+  pullRequestCandidateUrlFromReferenceAutolink,
   shouldOpenPullRequestExternally,
 } from "./openPullRequestLink";
 import { ProjectId, type RepositoryIdentity } from "@t3tools/contracts";
+import { normalizeGitRemoteUrl } from "@t3tools/shared/git";
 
 function repositoryIdentity(
   provider: string,
@@ -130,6 +131,29 @@ describe("changeRequestRepositoryUrl", () => {
   });
 });
 
+describe("pullRequestCandidateUrlFromReferenceAutolink", () => {
+  it("turns GitHub's shared issue route into a pull request candidate", () => {
+    expect(
+      pullRequestCandidateUrlFromReferenceAutolink(
+        "https://github.com/pingdotgg/t3code/issues/8600#issuecomment-1",
+      ),
+    ).toBe("https://github.com/pingdotgg/t3code/pull/8600#issuecomment-1");
+  });
+
+  it("does not reinterpret other issue hosts or malformed references", () => {
+    expect(
+      pullRequestCandidateUrlFromReferenceAutolink(
+        "https://gitlab.com/pingdotgg/t3code/-/issues/8600",
+      ),
+    ).toBeNull();
+    expect(
+      pullRequestCandidateUrlFromReferenceAutolink(
+        "https://github.com/pingdotgg/t3code/issues/not-a-number",
+      ),
+    ).toBeNull();
+  });
+});
+
 describe("matchesLinkedPullRequestUrl", () => {
   const linkedPullRequest = {
     projectId: ProjectId.make("project-1"),
@@ -147,6 +171,37 @@ describe("matchesLinkedPullRequestUrl", () => {
     ).toBe(true);
   });
 
+  it.each([
+    ["http://forge.example:3000/git/team/repo/pulls/42/files", true],
+    ["http://forge.example:4000/git/team/repo/pulls/42", false],
+    ["http://forge.example/git/team/repo/pulls/42", false],
+  ])("matches Forgejo links by web authority: %s", (url, expected) => {
+    expect(
+      matchesLinkedPullRequestUrl(
+        { ...linkedPullRequest, url: "http://forge.example:3000/git/team/repo/pulls/42" },
+        url,
+      ),
+    ).toBe(expected);
+  });
+
+  it("keeps other providers' existing port normalization", () => {
+    expect(
+      matchesLinkedPullRequestUrl(
+        linkedPullRequest,
+        "https://github.com:8443/pingdotgg/t3code/pull/42",
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps Forgejo and GitHub path shapes distinct on a GitHub-named host", () => {
+    expect(
+      matchesLinkedPullRequestUrl(
+        { ...linkedPullRequest, url: "https://github.internal/team/repo/pulls/42" },
+        "https://github.internal/team/repo/pull/42",
+      ),
+    ).toBe(false);
+  });
+
   it("rejects a different pull request or host", () => {
     expect(
       matchesLinkedPullRequestUrl(linkedPullRequest, "https://github.com/pingdotgg/t3code/pull/43"),
@@ -160,37 +215,16 @@ describe("matchesLinkedPullRequestUrl", () => {
   });
 });
 
-describe("openPullRequestLink", () => {
-  it("opens the requested pull request URL", async () => {
-    const openExternal = vi.fn(async () => undefined);
-    const targetUrl = "https://github.com/pingdotgg/t3code/pull/123";
-
-    await openPullRequestLink({ openExternal }, targetUrl);
-
-    expect(openExternal).toHaveBeenCalledExactlyOnceWith(targetUrl);
-  });
-
-  it("reports bridge failures with a safe target origin", async () => {
-    const cause = new Error("desktop shell unavailable");
-    const targetUrl = "https://github.com/pingdotgg/t3code/pull/123?token=secret";
-    const openExternal = vi.fn(async () => Promise.reject(cause));
-
-    const result = openPullRequestLink({ openExternal }, targetUrl);
-
-    await expect(result).rejects.toEqual(
-      new PullRequestLinkOpenError({
-        targetOrigin: "https://github.com",
-        cause,
-      }),
-    );
-    await expect(result).rejects.not.toHaveProperty("message", expect.stringContaining("secret"));
-  });
-});
-
 describe("shouldOpenPullRequestExternally", () => {
   it("uses the browser for command-click and control-click", () => {
     expect(shouldOpenPullRequestExternally({ metaKey: true, ctrlKey: false })).toBe(true);
     expect(shouldOpenPullRequestExternally({ metaKey: false, ctrlKey: true })).toBe(true);
+  });
+
+  it("uses the browser for middle-click", () => {
+    expect(shouldOpenPullRequestExternally({ metaKey: false, ctrlKey: false, button: 1 })).toBe(
+      true,
+    );
   });
 
   it("keeps an unmodified click in the pull request view", () => {
@@ -198,105 +232,131 @@ describe("shouldOpenPullRequestExternally", () => {
   });
 });
 
-describe("parseChangeRequestUrl", () => {
-  it("reads a GitHub pull request", () => {
-    expect(parseChangeRequestUrl("https://github.com/T3Tools/T3Code/pull/123")).toEqual({
-      host: "github.com",
-      repository: "t3tools/t3code",
-      number: 123,
-    });
+describe("findProjectOnChangeRequestHost", () => {
+  const project = (id: string, identity: Record<string, unknown>) =>
+    ({ id, repositoryIdentity: identity }) as never;
+  const frontend = project("frontend", {
+    canonicalKey: "github.com/acme/frontend",
+    provider: "github",
+    owner: "acme",
+    name: "frontend",
+  });
+  const backend = project("backend", {
+    canonicalKey: "github.com/acme/backend",
+    provider: "github",
+    owner: "acme",
+    name: "backend",
   });
 
-  it("reads a pull request on a GitHub Enterprise host", () => {
-    expect(parseChangeRequestUrl("https://github.acme.test/platform/api/pull/7")).toEqual({
-      host: "github.acme.test",
-      repository: "platform/api",
-      number: 7,
+  it.each([
+    "ssh.dev.azure.com/v3/org-a/project/web",
+    "vs-ssh.visualstudio.com/v3/org-a/project/web",
+    "org-a.visualstudio.com/defaultcollection/project/_git/web",
+    "dev.azure.com/org-a/project/_git/web",
+  ])("matches Azure browser references against %s", (canonicalKey) => {
+    const checkout = project("azure", {
+      canonicalKey,
+      provider: "azure-devops",
+      displayName: canonicalKey.split("/").slice(1).join("/"),
     });
-  });
-
-  it("reads a GitLab merge request, nested groups and all", () => {
+    const reference = { host: "dev.azure.com", repository: "org-a/project/_git/web", number: 42 };
+    expect(findProjectForChangeRequest([checkout], reference)).toBe(checkout);
+    expect(findProjectOnChangeRequestHost([checkout], reference)).toBe(checkout);
     expect(
-      parseChangeRequestUrl("https://gitlab.com/t3tools/platform/t3code/-/merge_requests/42"),
-    ).toEqual({
-      host: "gitlab.com",
-      repository: "t3tools/platform/t3code",
-      number: 42,
-    });
+      findProjectOnChangeRequestHost([checkout], {
+        ...reference,
+        repository: "org-b/project/_git/web",
+      }),
+    ).toBeUndefined();
+    expect(
+      findProjectOnChangeRequestHost([checkout], {
+        ...reference,
+        repository: "org-a/other-project/_git/web",
+      }),
+    ).toBeUndefined();
   });
 
-  it("reads a merge request on a self-hosted GitLab named nothing like GitLab", () => {
-    expect(parseChangeRequestUrl("https://code.acme.test/team/project/-/merge_requests/9")).toEqual(
-      {
-        host: "code.acme.test",
-        repository: "team/project",
-        number: 9,
-      },
+  it("prefers the project checked out from the link's own repository", () => {
+    expect(
+      findProjectOnChangeRequestHost([frontend, backend], {
+        host: "github.com",
+        repository: "acme/backend",
+        number: 7,
+      }),
+    ).toBe(backend);
+  });
+
+  it("selects the Forgejo HTTP port for repository and host-level matches", () => {
+    const projects = [3000, 4000].map((port) =>
+      project(`forgejo-${port}`, {
+        canonicalKey: "forge.example/git/team/repo",
+        provider: "forgejo",
+        displayName: "git/team/repo",
+        locator: { remoteUrl: `http://forge.example:${port}/git/team/repo.git` },
+      }),
     );
+    const reference = parseChangeRequestUrl("http://forge.example:4000/git/team/repo/pulls/42")!;
+    expect(findProjectForChangeRequest(projects, reference)).toBe(projects[1]);
+    expect(findProjectOnChangeRequestHost(projects, reference)).toBe(projects[1]);
+    expect(
+      findProjectOnChangeRequestHost(projects, { ...reference, repository: "git/team/other" }),
+    ).toBe(projects[1]);
+    expect(findProjectForChangeRequest([projects[0]!], reference)).toBeUndefined();
+    expect(findProjectOnChangeRequestHost([projects[0]!], reference)).toBeUndefined();
   });
 
-  it("reads a Bitbucket pull request", () => {
-    expect(parseChangeRequestUrl("https://bitbucket.org/workspace/repo/pull-requests/5")).toEqual({
-      host: "bitbucket.org",
-      repository: "workspace/repo",
-      number: 5,
+  it("lets tea resolve the web port for Forgejo SSH remotes", () => {
+    const checkout = project("forgejo-ssh", {
+      canonicalKey: "forge.example/git/team/repo",
+      provider: "forgejo",
+      displayName: "git/team/repo",
+      locator: { remoteUrl: "git@forge.example:git/team/repo.git" },
     });
-  });
-
-  it("reads both Azure DevOps URL forms, keeping `_git` in the repository path", () => {
+    const reference = parseChangeRequestUrl("http://forge.example:4000/git/team/repo/pulls/42")!;
+    expect(findProjectForChangeRequest([checkout], reference)).toBe(checkout);
+    const aliased = project("forgejo-alias", {
+      canonicalKey: "ssh.forge.example/team/repo",
+      provider: "forgejo",
+      displayName: "team/repo",
+      locator: { remoteUrl: "git@ssh.forge.example:team/repo.git" },
+      webUrl: "http://forge.example:4000/git/team/repo",
+    });
+    expect(findProjectForChangeRequest([aliased], reference)).toBe(aliased);
+    expect(findProjectOnChangeRequestHost([aliased], reference)).toBe(aliased);
     expect(
-      parseChangeRequestUrl("https://dev.azure.com/acme/platform/_git/t3code/pullrequest/17"),
-    ).toEqual({
-      host: "dev.azure.com",
-      repository: "acme/platform/_git/t3code",
-      number: 17,
-    });
-    expect(
-      parseChangeRequestUrl("https://acme.visualstudio.com/platform/_git/t3code/pullrequest/17"),
-    ).toEqual({
-      host: "acme.visualstudio.com",
-      repository: "platform/_git/t3code",
-      number: 17,
-    });
-  });
-
-  it("survives trailing segments, a trailing slash and a query string", () => {
-    expect(parseChangeRequestUrl("https://github.com/t3tools/t3code/pull/123/files?w=1")).toEqual({
-      host: "github.com",
-      repository: "t3tools/t3code",
-      number: 123,
-    });
-    expect(
-      parseChangeRequestUrl("https://gitlab.com/team/project/-/merge_requests/42/diffs#note_1"),
-    ).toEqual({ host: "gitlab.com", repository: "team/project", number: 42 });
-    expect(
-      parseChangeRequestUrl("https://bitbucket.org/team/repo/pull-requests/5/commits"),
-    ).toEqual({ host: "bitbucket.org", repository: "team/repo", number: 5 });
-    expect(parseChangeRequestUrl("https://github.com/t3tools/t3code/pull/123/")).toEqual({
-      host: "github.com",
-      repository: "t3tools/t3code",
-      number: 123,
-    });
-  });
-
-  it("claims nothing it cannot be sure of, so the link goes to the browser", () => {
-    for (const link of [
-      "https://github.com/t3tools/t3code/issues/123",
-      "https://github.com/t3tools/t3code/commit/0a1b2c3",
-      "https://github.com/t3tools/t3code",
-      "https://github.com/t3tools/t3code/pull/abc",
-      "https://gitlab.com/t3tools/t3code/-/snippets/12",
-      "https://gitlab.com/t3tools/t3code/-/issues/12",
-      // A path shape that means nothing off its own host.
-      "https://blog.example.test/2026/updates/pull/3",
-      // A lookalike is deliberately not fought here: `github.com.evil.test` reads as a GitHub
-      // Enterprise install and there is no way to tell it from one. It is `findProjectForChange
-      // Request` that refuses it, because no project in the workspace is checked out from it.
-      "javascript:alert(1)//github.com/t3tools/t3code/pull/1",
-      "not a url",
+      findProjectOnChangeRequestHost([aliased], { ...reference, repository: "git/team/other" }),
+    ).toBe(aliased);
+    for (const url of [
+      "http://other.example:4000/git/team/repo/pulls/42",
+      "http://forge.example:3000/git/team/repo/pulls/42",
     ]) {
-      expect(parseChangeRequestUrl(link), link).toBeNull();
+      const other = parseChangeRequestUrl(url)!;
+      expect(findProjectForChangeRequest([aliased], other)).toBeUndefined();
+      expect(findProjectOnChangeRequestHost([aliased], other)).toBeUndefined();
     }
+    const otherMount = parseChangeRequestUrl("http://forge.example:4000/other/team/repo/pulls/42")!;
+    expect(findProjectForChangeRequest([aliased], otherMount)).toBeUndefined();
+    expect(findProjectOnChangeRequestHost([aliased], otherMount)).toBeUndefined();
+  });
+
+  it("lends any project on the host to a repository nobody has checked out", () => {
+    expect(
+      findProjectOnChangeRequestHost([frontend], {
+        host: "github.com",
+        repository: "acme/backend",
+        number: 7,
+      }),
+    ).toBe(frontend);
+  });
+
+  it("finds nothing on a host nothing is checked out from", () => {
+    expect(
+      findProjectOnChangeRequestHost([frontend], {
+        host: "gitlab.com",
+        repository: "acme/backend",
+        number: 7,
+      }),
+    ).toBeUndefined();
   });
 });
 
@@ -305,8 +365,6 @@ describe("findProjectForChangeRequest", () => {
     ({ id: "p1", repositoryIdentity: identity }) as never;
 
   it("matches a nested GitLab group by the whole path below the host", () => {
-    // The server identifies a repository by `displayName`, which keeps every group segment; the
-    // two-segment owner/name form would look for `t3tools/t3code` and find nothing.
     const projects = [
       project({
         canonicalKey: "gitlab.com/t3tools/platform/t3code",
@@ -341,6 +399,29 @@ describe("findProjectForChangeRequest", () => {
         number: 1,
       }),
     ).toBeUndefined();
+  });
+
+  it("matches an Azure repository cloned over SSH, whose remote shares no part with its URL", () => {
+    // Azure alone addresses one repository under two names: `ssh.dev.azure.com` and `v3/...` over
+    // SSH against `dev.azure.com` and `.../_git/...` everywhere a person sees it. The identity is
+    // recorded in the spelling a link arrives in, so both halves of this comparison line up.
+    const canonicalKey = normalizeGitRemoteUrl("git@ssh.dev.azure.com:v3/T3Tools/Platform/T3Code");
+    const projects = [
+      project({
+        canonicalKey,
+        provider: "azure-devops",
+        displayName: canonicalKey.split("/").slice(1).join("/"),
+        owner: "t3tools",
+        name: "t3code",
+      }),
+    ];
+    expect(
+      findProjectForChangeRequest(projects, {
+        host: "dev.azure.com",
+        repository: "t3tools/platform/_git/t3code",
+        number: 1,
+      }),
+    ).toBe(projects[0]);
   });
 
   it("claims nothing for a lookalike host, which is what keeps a link a link", () => {

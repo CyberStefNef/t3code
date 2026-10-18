@@ -1,50 +1,84 @@
 # Mobile development lifecycle
 
-Ordinary component changes use Metro Fast Refresh. The connection runtime uses
-a stable development-only atom runtime whose writable layer atom receives the
-newly evaluated Effect layer. Its module accepts the update only after installing
-that layer. Existing subscribers observe the new context, and Effect releases the
-previous runtime scope without restarting React Navigation. Production uses an
-ordinary `Atom.runtime` without this hot-update boundary.
+The [connection runtime's HMR boundary](../../apps/mobile/src/lib/hot-swappable-atom-runtime.ts)
+keeps a stable atom runtime and replaces its Effect layer through a writable atom.
+It accepts the update only after installing the new layer. Otherwise importers
+retain the old behavior even though Metro reports a successful refresh.
 
-Replacing the atom registry itself disposes its old nodes; replacing the managed
-runtime starts its asynchronous disposal. These modules use normal Metro update
-propagation. The app does not call `DevSettings.reload` during their replacement.
-React can still reset state when its normal Fast Refresh rules require it.
+Do not reset the shared atom registry to refresh a connection-runtime edit. Reset
+removes listeners from mounted consumers that Metro has no reason to rerender.
+When the registry or managed-runtime module itself changes, normal Metro propagation
+disposes its old resources. This boundary does not make arbitrary module-level atom
+families safe to hot-swap. Production uses an ordinary atom runtime.
 
-Do not reset the shared registry to clean up a connection-runtime edit: registry
-reset removes listeners from unedited mounted consumers. Do not self-accept a
-runtime module while leaving importers attached to its old implementation. A
-hot-update boundary must install fresh behavior through the existing reactive
-dependencies. These boundaries do not make every module-level atom family in the
-app hot-swappable; new runtime singletons still need explicit ownership. Editing
-the registry or managed runtime can still rebuild a much larger dependency graph
-than an ordinary component or connection-runtime edit.
+[Environment supervisor scopes](../../packages/client-runtime/src/connection/registry.ts)
+are children of the registry scope. The per-environment map supports targeted
+shutdown, but a supervisor created after its cleanup runs would escape it. A closed
+parent scope also closes late arrivals, preventing interrupted startup or runtime
+replacement from leaving a WebSocket alive outside the new registry.
 
-Environment supervisor scopes are children of the connection registry scope.
-The registry's per-environment map supports targeted shutdown, but it cannot be
-the sole owner: a supervisor created after that map's finalizer has run must
-still inherit the closed parent scope. Otherwise interrupted startup or runtime
-replacement can leave a session and WebSocket alive outside the current registry.
+Uniwind compiles CSS on Metro updates so newly used classes are discovered. It
+skips global style invalidation only when the generated stylesheet and theme list
+are unchanged. Skipping compilation would lose new classes; invalidating every
+consumer for unchanged output makes an ordinary component edit refresh the whole
+app. The fingerprint is recorded only after initialization succeeds.
 
-The compact Home list owns its minute-based presentation clock in a focus effect.
-Blur clears the interval without a render-driving focus subscription; focus
-refreshes the clock immediately. Other prop or state changes can still render
-the hidden list. Exact snooze-expiry timers remain active, and the visible iPad
-sidebar keeps its own minute updates.
+The [expo-notifications patch](../../patches/expo-notifications@57.0.15.patch) protects
+`NotificationCenterManager`'s delegates and pending responses with a lock. React runtimes can
+register and remove delegates concurrently during reloads or scene startup. Delivery snapshots
+delegates under the lock and invokes them after releasing it. Pending-response replay removes
+only the responses in its snapshot, preserving responses received during callbacks. Changes to
+this native patch require reinstalling dependencies and rebuilding the iOS app.
+The native modules under `apps/mobile/modules/` are `file:` dependencies, and pnpm
+copies those into its virtual store instead of linking them. Metro bundles the copy,
+so an edit to a module's TypeScript is invisible to a running dev client until
+`vp i` re-syncs it, while Gradle and CocoaPods compile the worktree directory
+directly. A JavaScript change that "has no effect" on device is usually this.
 
-Connection and runtime projections are shared per environment. Thread selection
-consumers should read those atoms instead of repeatedly parsing the same socket
-URL or constructing new connection objects during each render.
+## Measuring renders
 
-The Uniwind dependency patch still recompiles CSS on Metro updates so newly used
-classes are discovered. It fingerprints the generated native stylesheet and
-theme list, then skips development-only global invalidation when that output is
-unchanged. A changed stylesheet or theme list still resets the style caches and
-notifies subscribers. The digest is committed only after initialization succeeds.
-Web and production retain their existing initialization behavior.
+[`render-counter.ts`](../../apps/mobile/src/features/development/render-counter.ts) counts the
+components React rendered in each commit and why: a changed state slot, changed props, or
+context. It wraps the DevTools hook from the first import in `index.ts` and loads only when
+`__DEV__` and `EXPO_PUBLIC_T3_RENDER_COUNTER=1`, so release bundles never contain it. The walk
+skips subtrees React bailed out of. A probe that checks `flags & 1` on every fiber reports
+renders that never happened, because bailed-out fibers keep flags from older commits.
 
-After installing or changing the Uniwind patch, restart Metro once with
-`vp run dev:client:reset` from `apps/mobile`. pnpm gives patched packages new
-filesystem paths, and cached transforms can otherwise retain references to the
-previous package. Ordinary development starts should retain the transform cache.
+[`measure-renders.mts`](../../apps/mobile/scripts/measure-renders.mts) drives a measurement from
+outside the app. It evaluates the counter's globals through Metro's Hermes inspector proxy, which
+works the same for iOS simulators and Android emulators and needs no taps, `simctl`, or `adb`. It
+starts a real provider turn through the server, opens the thread with an app link, records a window
+mid-stream, and prints the median renders, commits, top components and top causes. Expo drops inspector sockets whose `Origin` is not the URL Metro advertises, so
+pass that URL (the LAN address with `--lan`) as `--metro`.
+
+```bash
+EXPO_PUBLIC_T3_RENDER_COUNTER=1 vp run dev:client   # in apps/mobile, then pair the app
+node apps/server/src/bin.ts auth session issue --base-dir <base-dir> --token-only
+node apps/mobile/scripts/measure-renders.mts --server <server-origin> --token <token> \
+  --metro http://<metro-lan-host>:8081 --project-root <scratch-dir>
+```
+
+`--route /settings/usage` instead reloads the app, opens that path from Home and records a 6 s window over
+mount and data settling, with no provider turn and no `--server`, `--token` or `--project-root`.
+With `--server` as well, the app reloads, opens that path (`/` stays on Home) and the reply streams in a
+new thread the app never shows, which measures what streaming elsewhere costs the screen in front.
+
+Compare before and after on the same base, on the same device, with the median of three runs.
+Provider output varies run to run, so a single run or a comparison across bases is noise.
+
+## React Compiler
+
+Metro runs the compiler only because `experiments.reactCompiler` is set in `app.config.ts`. Expo
+then passes `supportsReactCompiler` to `babel-preset-expo`, which owns the plugin options; there is
+no `babel.config.js` entry to look for. Release bundles use `panicThreshold: "NONE"`, so a function
+the compiler can't prove safe ships unmemoized with no build error.
+[`reactCompilerCoverage.test.ts`](../../apps/mobile/src/reactCompilerCoverage.test.ts) runs the
+same preset over every source file. It fails on a new bailout, and on a file in `KNOWN_BAILOUTS`
+that now compiles, so the list only shrinks. When you fix a listed file, delete its entry and its
+manual `useMemo`/`useCallback`/`memo` in the same change. Most mobile bailouts are `try` without
+`catch` or with `finally`, and refs read during render; see [Web UI](web-ui.md#react-compiler)
+for the usual rewrites. Mobile runs `t3code/no-manual-memo` with `allowMemoHooks`, so memo
+directives are errors but the hooks stay legal until `KNOWN_BAILOUTS` is empty.
+`t3code/no-hookless-use-function` rejects a `use*` function that calls no hook, since the compiler
+leaves it uncached. A platform stub of a real hook, such as an `.android.ts` file, keeps the hook
+name and suppresses the rule with a reason.
