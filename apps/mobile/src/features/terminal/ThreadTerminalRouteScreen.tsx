@@ -204,8 +204,6 @@ type TerminalToolbarAction =
       readonly modifier: PendingModifier;
     };
 
-// A blank param (a hand-typed deep link) is treated as missing, since branded
-// IDs reject whitespace-only values.
 function firstRouteParam(value: string | string[] | undefined): string | null {
   const first = Array.isArray(value) ? value[0] : value;
   return first === undefined || first.trim().length === 0 ? null : first;
@@ -294,8 +292,16 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
   const isEnvironmentReady = environment.presentation?.connection.phase === "connected";
   const requestedTerminalId = firstRouteParam(params.terminalId);
   const terminalId = requestedTerminalId ?? DEFAULT_TERMINAL_ID;
+  // The native view treats any new positive value as a capture, including the first value a
+  // freshly created view receives after a reconnect or remount. Only pass a value while a
+  // capture is pending, and keep the sequence increasing so the next request always differs.
+  const captureSequenceRef = useRef(0);
   const [captureRequest, setCaptureRequest] = useState(0);
   const [capturedOutput, setCapturedOutput] = useState<string | null>(null);
+  const requestCapture = () => {
+    captureSequenceRef.current += 1;
+    setCaptureRequest(captureSequenceRef.current);
+  };
   const {
     isReady: hasResolvedFontPreference,
     appearance,
@@ -378,7 +384,6 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
   const lastBufferReplayKeyRef = useRef<string | null>(null);
   const sentInitialInputKeyRef = useRef<string | null>(null);
   const [readyBufferReplayKey, setReadyBufferReplayKey] = useState<string | null>(null);
-  /** Default grid is always valid for attach; onResize refines cols/rows. Requiring a cached size blocked bootstrap for new terminal routes. */
   const [hasMeasuredSurface, setHasMeasuredSurface] = useState(true);
   const [pendingModifierState, setPendingModifierState] = useState<{
     readonly terminalId: string;
@@ -548,7 +553,6 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
     routeEnvironmentId === null
       ? null
       : (serverConfigs.get(routeEnvironmentId)?.environment.platform.os ?? null);
-  // The descriptor is authoritative; the label is only a hint until it arrives.
   const hostPlatform = useMemo(
     () =>
       hostPlatformFromOs(hostOs) ??
@@ -791,7 +795,6 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
     setHasMeasuredSurface(true);
   }, [routeEnvironmentId, routeThreadId, terminalId]);
 
-  /** Resolves true once the pty accepted the write, false if it was skipped or rejected. */
   const writeInput = useCallback(
     async (data: string): Promise<boolean> => {
       if (
@@ -821,7 +824,6 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
   }
   const pasteSession = pasteSessionRef.current;
 
-  // Drop delayed clipboard reads whenever the route or attached pty changes.
   useEffect(() => {
     pasteSession.reset(canOperateTerminal && isRunning);
     return () => {
@@ -839,7 +841,6 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
     });
   }, [pasteSession, terminalId, writeInput]);
 
-  /** Sends a key through the armed toolbar modifier, if any, and disarms it. */
   const writeModifiedInput = useCallback(
     (data: string) => {
       if (pendingModifier === null) {
@@ -944,8 +945,6 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
   }, [navigation, params.environmentId, params.threadId]);
 
   const navigateAwayAfterExit = useCallback(() => {
-    // With other shells still live, fall through to the previous one instead
-    // of dropping the user back on the thread.
     const fallbackTerminalId = previousLiveTerminalId({
       sessions: terminalMenuSessions,
       exitedTerminalId: terminalId,
@@ -964,8 +963,6 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
       navigation.goBack();
       return;
     }
-    // Deep-linked/root mounts have nothing to pop; land on the thread
-    // instead of stranding the user on a dead terminal.
     if (selectedThread) {
       navigation.dispatch(
         StackActions.replace("Thread", {
@@ -1020,7 +1017,6 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
         navigateAwayAfterExit();
         return;
       }
-      // Leave a background terminal screen when it is focused again.
       pendingExitNavigationRef.current = terminalKey;
     },
   });
@@ -1283,6 +1279,7 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
                   keyboardFocusRequest={keyboardFocusRequest}
                   captureRequest={captureRequest}
                   onCapture={(text) => {
+                    setCaptureRequest(0);
                     if (text.trim()) setCapturedOutput(text);
                     else
                       Dialog.alert("No terminal output", "There is no visible output to attach.");
@@ -1298,11 +1295,7 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
               {Platform.OS === "android" && !keyboardState.isVisible ? (
                 <View className="min-h-14 flex-row items-center gap-2 bg-card-alt px-2">
                   {selectedThread && hasNativeTerminalSurface() ? (
-                    <Button
-                      label="Attach output"
-                      tone="text"
-                      onPress={() => setCaptureRequest((value) => value + 1)}
-                    />
+                    <Button label="Attach output" tone="text" onPress={requestCapture} />
                   ) : null}
                   <View className="flex-1" />
                   <IconButton
@@ -1317,7 +1310,7 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
                   accessibilityRole="button"
                   onPress={() => {
                     KeyboardController.dismiss();
-                    setCaptureRequest((value) => value + 1);
+                    requestCapture();
                   }}
                   className="px-4 py-2"
                 >

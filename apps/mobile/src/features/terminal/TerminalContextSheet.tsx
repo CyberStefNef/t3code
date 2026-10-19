@@ -16,7 +16,6 @@ import { Button } from "../../components/ui/Button";
 import { uuidv4 } from "../../lib/uuid";
 import { insertComposerDraftContext } from "../../state/use-composer-drafts";
 
-/** Line numbers are relative to this frozen viewport, not the terminal's scrollback. */
 export function TerminalContextSheet(props: {
   text: string;
   environmentId: EnvironmentId;
@@ -59,6 +58,7 @@ export function TerminalContextSheet(props: {
   return (
     <Sheet title="Terminal output" onClose={props.onClose}>
       <ScrollView
+        nestedScrollEnabled
         className="flex-1"
         contentInsetAdjustmentBehavior={Platform.OS === "ios" ? "automatic" : "never"}
         contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 12, paddingBottom: 20 }}

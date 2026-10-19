@@ -22,7 +22,6 @@ const APPEARANCES = [
   { id: "dark", title: "Dark" },
 ] as const;
 
-/** One preset per kind of screen; the web's device toolbar offers the full list. */
 const VIEWPORTS = [
   { id: "fill", title: "Fit to screen", setting: FILL_PREVIEW_VIEWPORT },
   ...(["Phone", "Tablet", "Desktop"] as const).flatMap((category) => {
@@ -38,19 +37,16 @@ const VIEWPORTS = [
   }),
 ];
 
-/**
- * The browser tab's menu: appearance, zoom, viewport, a hard reload, and its
- * profile's site data. Each runs through the environment, as on web and
- * desktop, so every client and agent sees the same tab. None need control.
- */
 export function BrowserTabMenu({
   environmentId,
   tab,
   disabled,
+  onPaste,
 }: {
   readonly environmentId: EnvironmentId;
   readonly tab: PreviewSessionSnapshot;
   readonly disabled: boolean;
+  readonly onPaste?: () => void;
 }) {
   const adjust = useAtomCommand(previewEnvironment.adjust, "browser tab change");
   const resize = useAtomCommand(previewEnvironment.resize, "browser viewport change");
@@ -70,6 +66,7 @@ export function BrowserTabMenu({
         : "custom";
 
   const actions: MenuAction[] = [
+    ...(onPaste ? [{ id: "paste", title: "Paste", image: "doc.on.clipboard" }] : []),
     { id: "hard-reload", title: "Hard reload", image: "arrow.clockwise.circle" },
     {
       id: "appearance",
@@ -118,6 +115,7 @@ export function BrowserTabMenu({
   };
 
   const onAction = (id: string) => {
+    if (id === "paste") return onPaste?.();
     if (id === "hard-reload") return void run({ hardReload: true });
     if (id === "zoom:in") return void run({ zoomFactor: zoomTo(1) });
     if (id === "zoom:out") return void run({ zoomFactor: zoomTo(-1) });

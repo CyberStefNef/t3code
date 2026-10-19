@@ -54,7 +54,6 @@ import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 
-/** The shared application event log and its command receipts. */
 export const layerEventInfrastructure = Layer.mergeAll(
   OrchestrationEventStore.layer,
   OrchestrationCommandReceipts.layer,
@@ -156,6 +155,7 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
       layerEventSinkProvided,
       IdAllocator.layer,
       layerProviderEventIngestorProvided,
+      TurnItemPositionStore.layer,
     ),
   ),
 );

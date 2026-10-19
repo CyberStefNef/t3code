@@ -215,7 +215,6 @@ export function CustomSnoozeSheet(props: {
   );
 }
 
-/** The popover owns a native navigation bar, just like the app's sheet screens. */
 function SnoozePopoverNavigation(props: {
   readonly width: number;
   readonly height: number;
@@ -258,7 +257,13 @@ function SnoozePopoverNavigation(props: {
                         />
                       </Toolbar>
                       <Toolbar placement="right">
-                        <Toolbar.Button label="Snooze" onPress={props.onSubmit} />
+                        <Toolbar.Button
+                          accessibilityLabel="Snooze"
+                          icon="checkmark"
+                          variant="prominent"
+                          tintColor={colors["--color-prominent-action"]}
+                          onPress={props.onSubmit}
+                        />
                       </Toolbar>
                       <ScrollView
                         contentInsetAdjustmentBehavior="automatic"

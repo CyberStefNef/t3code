@@ -25,6 +25,7 @@ import { WebView } from "react-native-webview";
 import * as Clipboard from "expo-clipboard";
 
 import { AppText } from "../../components/ui/AppText";
+import { PdfPreview } from "../../components/PdfPreview";
 import { downloadAndShareAttachment } from "../../lib/attachmentDownload";
 import { beginForegroundHandoff } from "../../lib/foreground-handoff";
 import { usePreviewStreamAccess } from "../../state/preview";
@@ -37,8 +38,8 @@ import {
 } from "./preview-stream-document";
 
 export interface PreviewStreamRef {
-  /** Navigation requires current control of the browser. */
   readonly command: (input: PreviewStreamInput) => void;
+  readonly paste: () => void;
   readonly togglePictureInPicture: () => void;
 }
 
@@ -49,20 +50,17 @@ export interface PreviewPictureInPictureState {
 
 type NativeStreamBridge = {
   readonly ref?: Ref<PreviewStreamRef>;
-  /** Refresh stream access; new access remounts the document with a fresh ticket. */
   readonly onUnauthorized: () => void;
-  /** The tab was closed on the server. */
   readonly onGone?: () => void;
   readonly onViewport?: (viewport: { readonly width: number; readonly height: number }) => void;
   readonly onControl?: (control: PreviewStreamControl | null) => void;
   readonly onPictureInPicture?: (state: PreviewPictureInPictureState, detail?: string) => void;
   /** True while frames show, so commands reach the page. Pass a stable function. */
   readonly onStreamingChange?: (streaming: boolean) => void;
-  /** The floating player shows a spinner without text or a reconnect button. */
   readonly compact?: boolean;
+  readonly pdfUri?: string | null;
 };
 
-/** Picks files on this device and sends them to the page's open picker; none cancels it. */
 async function sendFilesToPage(chooser: PreviewStreamFileChooser, pick: boolean) {
   const body = new FormData();
   if (pick) {
@@ -91,7 +89,6 @@ async function sendFilesToPage(chooser: PreviewStreamFileChooser, pick: boolean)
   if (!response.ok) throw new Error((await response.text()) || "The upload was refused.");
 }
 
-/** The file is on the environment; saving it here goes through the share sheet. */
 function offerDownload(download: PreviewStreamDownload) {
   Dialog.alert(`Downloaded ${download.fileName}`, undefined, [
     { text: "Not now", style: "cancel" },
@@ -112,8 +109,6 @@ function offerDownload(download: PreviewStreamDownload) {
   ]);
 }
 
-// Consecutive refused tickets before the view stops and offers Reconnect, e.g. a
-// session without operate scope.
 const MAX_REFUSALS = 3;
 
 export function PreviewStreamWebView(
@@ -195,7 +190,6 @@ function AuthorizedPreviewStream({
       ref={ref}
       configuration={configuration}
       onUnauthorized={() => {
-        // The client has stopped. Restart it with a fresh ticket, backing off between refusals.
         const refusals = ++unauthorized.current;
         if (refusals >= MAX_REFUSALS) return false;
         if (refreshTimer.current !== null) clearTimeout(refreshTimer.current);
@@ -232,6 +226,7 @@ function PreviewStreamDocumentView({
   configuration,
   background,
   compact,
+  pdfUri,
   onUnauthorized,
   onGone,
   onViewport,
@@ -244,7 +239,6 @@ function PreviewStreamDocumentView({
 }: Omit<NativeStreamBridge, "onUnauthorized"> & {
   readonly configuration: string;
   readonly background: string;
-  /** False when the view should stop retrying and fail. */
   readonly onUnauthorized: () => boolean;
   readonly onRetry: () => void;
   readonly onStreaming: () => void;
@@ -278,6 +272,15 @@ function PreviewStreamDocumentView({
     webView.current?.injectJavaScript(
       `window.T3PreviewStream?.command(${JSON.stringify(input)}); true;`,
     );
+  // Reads here rather than in the screen: a tab switch during the iOS paste prompt unmounts
+  // this view and nulls its WebView ref, so the text can never type into another tab.
+  const paste = () =>
+    void Clipboard.getStringAsync().then(
+      (text) => {
+        if (text) command({ type: "text", text });
+      },
+      () => Dialog.alert("Could not read the clipboard"),
+    );
   const fail = (message: string) => {
     if (!active.current || failed.current) return;
     failed.current = true;
@@ -289,7 +292,6 @@ function PreviewStreamDocumentView({
     setError(message);
     setStatus("error");
   };
-  // The shared transport owns reconnects once the document acknowledges startup.
   const bootstrapTimedOut = useEffectEvent(() =>
     fail("Browser viewer could not start. Reconnect to try again."),
   );
@@ -307,6 +309,7 @@ function PreviewStreamDocumentView({
   );
   useImperativeHandle(ref, () => ({
     command,
+    paste,
     togglePictureInPicture: () =>
       webView.current?.injectJavaScript("window.T3PreviewStream?.pictureInPicture(); true;"),
   }));
@@ -348,88 +351,94 @@ function PreviewStreamDocumentView({
           ) : null}
         </View>
       ) : null}
-      <WebView<object>
-        ref={webView}
-        source={source}
-        originWhitelist={["*"]}
-        scrollEnabled={false}
-        bounces={false}
-        mixedContentMode="always"
-        allowUniversalAccessFromFileURLs
-        contentInsetAdjustmentBehavior="never"
-        setSupportMultipleWindows={false}
-        // Picture in picture plays the canvas as an inline muted video, started from native chrome.
-        allowsInlineMediaPlayback
-        allowsPictureInPictureMediaPlayback
-        mediaPlaybackRequiresUserAction={false}
-        style={{ flex: 1, backgroundColor: background }}
-        onError={() => fail("Browser viewer could not load. Reconnect to try again.")}
-        onHttpError={() => fail("Browser viewer could not load. Reconnect to try again.")}
-        onContentProcessDidTerminate={processTerminated}
-        onRenderProcessGone={processTerminated}
-        onShouldStartLoadWithRequest={(request) =>
-          request.url === "about:blank" || request.url === source.baseUrl
-        }
-        onMessage={(event) => {
-          if (!active.current || failed.current) return;
-          const message = previewStreamMessage(event.nativeEvent.data);
-          if (message === null) return;
-          switch (message.type) {
-            case "control": {
-              setControl(message);
-              const previousDialog = dialogRef.current;
-              dialogRef.current = message.dialog;
-              setPromptText((draft) => previewPromptText(previousDialog, message.dialog, draft));
-              onControl?.(message);
-              return;
-            }
-            case "unauthorized":
-              if (!onUnauthorized()) {
-                fail("This session can't open the browser stream. Reconnect to try again.");
-              }
-              return;
-            case "gone":
-              setGone(true);
-              fail("This tab was closed.");
-              onGone?.();
-              return;
-            case "hostSetup":
-              setHostSetup({ need: message.need, command: message.command });
-              fail(previewStreamHostSetupMessage(message));
-              return;
-            case "viewport":
-              onViewport?.(message);
-              return;
-            case "clipboard":
-              void Clipboard.setStringAsync(message.text).catch(() => undefined);
-              return;
-            case "download":
-              offerDownload(message);
-              return;
-            case "fileChooser":
-              setFileChooser(message.chooser);
-              return;
-            case "pictureInPicture":
-              onPictureInPicture?.(message, message.detail);
-              return;
-            case "status":
-              setStarted(true);
-              if (message.status === "error") {
-                fail(message.detail ?? "Browser stream failed.");
+      <View className="relative flex-1">
+        <WebView<object>
+          ref={webView}
+          source={source}
+          originWhitelist={["*"]}
+          scrollEnabled={false}
+          bounces={false}
+          mixedContentMode="always"
+          allowUniversalAccessFromFileURLs
+          contentInsetAdjustmentBehavior="never"
+          setSupportMultipleWindows={false}
+          allowsInlineMediaPlayback
+          allowsPictureInPictureMediaPlayback
+          mediaPlaybackRequiresUserAction={false}
+          style={{ flex: 1, backgroundColor: background }}
+          onError={() => fail("Browser viewer could not load. Reconnect to try again.")}
+          onHttpError={() => fail("Browser viewer could not load. Reconnect to try again.")}
+          onContentProcessDidTerminate={processTerminated}
+          onRenderProcessGone={processTerminated}
+          onShouldStartLoadWithRequest={(request) =>
+            request.url === "about:blank" || request.url === source.baseUrl
+          }
+          onMessage={(event) => {
+            if (!active.current || failed.current) return;
+            const message = previewStreamMessage(event.nativeEvent.data);
+            if (message === null) return;
+            switch (message.type) {
+              case "control": {
+                setControl(message);
+                const previousDialog = dialogRef.current;
+                dialogRef.current = message.dialog;
+                setPromptText((draft) => previewPromptText(previousDialog, message.dialog, draft));
+                onControl?.(message);
                 return;
               }
-              setStatus(message.status);
-              if (message.status === "connecting") {
-                // Dialogs may have closed and reopened while this viewer was disconnected.
-                dialogRef.current = null;
-                setControl(null);
-                onControl?.(null);
-              }
-              onStreamingChange?.(message.status === "streaming");
-              if (message.status === "streaming") onStreaming();
-          }
-        }}
-      />
+              case "unauthorized":
+                if (!onUnauthorized()) {
+                  fail("This session can't open the browser stream. Reconnect to try again.");
+                }
+                return;
+              case "gone":
+                setGone(true);
+                fail("This tab was closed.");
+                onGone?.();
+                return;
+              case "hostSetup":
+                setHostSetup({ need: message.need, command: message.command });
+                fail(previewStreamHostSetupMessage(message));
+                return;
+              case "viewport":
+                onViewport?.(message);
+                return;
+              case "clipboard":
+                void Clipboard.setStringAsync(message.text).catch(() => undefined);
+                return;
+              case "download":
+                offerDownload(message);
+                return;
+              case "fileChooser":
+                setFileChooser(message.chooser);
+                return;
+              case "pictureInPicture":
+                onPictureInPicture?.(message, message.detail);
+                return;
+              case "status":
+                setStarted(true);
+                if (message.status === "error") {
+                  fail(message.detail ?? "Browser stream failed.");
+                  return;
+                }
+                setStatus(message.status);
+                if (message.status === "connecting") {
+                  // Dialogs may have closed and reopened while this viewer was disconnected.
+                  dialogRef.current = null;
+                  setControl(null);
+                  onControl?.(null);
+                }
+                onStreamingChange?.(message.status === "streaming");
+                if (message.status === "streaming") onStreaming();
+            }
+          }}
+        />
+        {pdfUri ? (
+          <View className="absolute inset-0">
+            <PdfPreview key={pdfUri} uri={pdfUri} />
+          </View>
+        ) : null}
+      </View>
       {!compact && fileChooser && control?.controller === "you" ? (
         <View className="absolute inset-x-3 top-16 gap-3 rounded-xl border border-secondary-border bg-secondary p-4">
           <AppText className="text-sm text-secondary-foreground">

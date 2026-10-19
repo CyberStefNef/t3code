@@ -1,3 +1,5 @@
+import { AsyncResult } from "effect/reactivity";
+import { settlePromise, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import * as Dialog from "../../components/ui/Dialog";
 import { useNavigation, useNavigationState, useRoute } from "@react-navigation/native";
 import { threadPullRequestLinkMode } from "@t3tools/client-runtime/thread-pull-request-compatibility";
@@ -39,7 +41,6 @@ import {
 
 type LinkedThread = PullRequestLinkedThreadsResult["threads"][number];
 
-/** Stay in the PR's environment when entering a thread or creating its draft. */
 export function usePullRequestThreads(
   params: PullRequestParams,
   pr: PullRequestDetail | null,
@@ -68,7 +69,6 @@ export function usePullRequestThreads(
     (relations.data ?? (lastRelations.key === key ? lastRelations.data : null))?.threads ?? [];
   const connected = usePullRequestConnected(params.environmentId);
   const canOperate = useEnvironmentScope(target.environmentId, AuthOrchestrationOperateScope);
-  // Composing offline only writes a local draft. The outbox checks grants on delivery.
   const canAsk = !connected || canOperate;
   const canCheckout = useEnvironmentScope(target.environmentId, AuthSourceControlWriteScope);
   const navigation = useNavigation();
@@ -85,7 +85,7 @@ export function usePullRequestThreads(
     if (!pr || !canAsk || pending.current) return;
     pending.current = true;
     setBusy(true);
-    try {
+    const result = await settlePromise(async () => {
       if (connected && !thread && !canCheckout)
         throw new Error("Starting work from this PR requires source control write access.");
       await waitForComposerDraftsLoaded();
@@ -150,11 +150,12 @@ export function usePullRequestThreads(
           screen: "NewTaskDraft",
           params: { draftId: draftKey, title: `Ask about #${pr.number}` },
         });
-    } catch (cause) {
+    });
+    pending.current = false;
+    setBusy(false);
+    if (AsyncResult.isFailure(result)) {
+      const cause = squashAtomCommandFailure(result);
       Dialog.alert("Couldn't open a thread", cause instanceof Error ? cause.message : "Try again.");
-    } finally {
-      pending.current = false;
-      setBusy(false);
     }
   };
   return {

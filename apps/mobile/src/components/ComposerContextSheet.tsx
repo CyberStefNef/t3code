@@ -73,7 +73,6 @@ function ContextSource(props: { source: ElementContextSource | null }) {
   );
 }
 
-/** Touch equivalent of the web context popover; snapshots remain readable offline. */
 export function ComposerContextSheet(props: {
   readonly label: string;
   readonly record: ComposerContextRecord | undefined;
@@ -186,6 +185,7 @@ export function ComposerContextSheet(props: {
   return (
     <Sheet title={terminal?.terminalLabel ?? props.label} onClose={props.onClose}>
       <ScrollView
+        nestedScrollEnabled
         className="flex-1"
         contentInsetAdjustmentBehavior={Platform.OS === "ios" ? "automatic" : "never"}
         contentContainerStyle={{
