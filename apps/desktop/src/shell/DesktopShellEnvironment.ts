@@ -457,12 +457,17 @@ const installPosixEnvironment = Effect.fn("desktop.shellEnvironment.installPosix
       config.platform === "darwin" && !shellEnvironment.PATH
         ? yield* readLaunchctlPath
         : Option.none<string>();
+    const preferredPath = trimNonEmpty(shellEnvironment.PATH).pipe(
+      Option.orElse(() => launchctlPath),
+    );
+    // With no probe result the inherited PATH keeps its order, so a caller-chosen
+    // nvm/mise/fnm binary is not shadowed by the known dirs added after it.
     const mergedPath = mergePaths(config.platform, [
-      trimNonEmpty(shellEnvironment.PATH).pipe(
-        Option.orElse(() => launchctlPath),
-        Option.orElseSome(() => resolveKnownPosixCliDirs(config.env, config.platform).join(":")),
-      ),
+      preferredPath,
       readEnvPath(config.env),
+      Option.isNone(preferredPath)
+        ? Option.some(resolveKnownPosixCliDirs(config.env, config.platform).join(":"))
+        : Option.none<string>(),
     ]);
 
     if (Option.isSome(mergedPath)) {

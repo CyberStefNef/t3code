@@ -439,12 +439,13 @@ describe("DesktopShellEnvironment", () => {
     }),
   );
 
-  it.effect("falls back to known CLI directories on macOS when neither probe returns a PATH", () =>
+  it.effect("appends known CLI directories on macOS when neither probe returns a PATH", () =>
     Effect.gen(function* () {
-      // The Finder-launch environment: no SHELL, and the bare PATH launchd hands a .app.
+      // No SHELL, and the bare PATH launchd hands a .app, with a caller-chosen
+      // toolchain dir in front that must stay ahead of the fallback dirs.
       const env: NodeJS.ProcessEnv = {
         HOME: "/Users/test",
-        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        PATH: "/Users/test/.nvm/versions/node/v22.0.0/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
       };
 
       yield* runShellEnvironment({
@@ -455,7 +456,7 @@ describe("DesktopShellEnvironment", () => {
 
       assert.equal(
         env.PATH,
-        "/opt/homebrew/bin:/usr/local/bin:/Users/test/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "/Users/test/.nvm/versions/node/v22.0.0/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/Users/test/.local/bin",
       );
     }),
   );

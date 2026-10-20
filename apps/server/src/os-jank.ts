@@ -36,11 +36,12 @@ function hydratePosixPath(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): vo
 
   const shellPath = shellEnvironment.PATH;
   const launchctlPath = platform === "darwin" && !shellPath ? readPathFromLaunchctl() : undefined;
-  const mergedPath = mergePathEntries(
-    shellPath ?? launchctlPath ?? resolveKnownPosixCliDirs(env, platform).join(":"),
-    env.PATH,
-    platform,
-  );
+  const preferredPath = shellPath ?? launchctlPath;
+  // With no probe result the inherited PATH keeps its order, so a caller-chosen
+  // nvm/mise/fnm binary is not shadowed by the known dirs added after it.
+  const mergedPath = preferredPath
+    ? mergePathEntries(preferredPath, env.PATH, platform)
+    : mergePathEntries(env.PATH, resolveKnownPosixCliDirs(env, platform).join(":"), platform);
   if (mergedPath) {
     env.PATH = mergedPath;
   }
