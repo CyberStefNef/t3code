@@ -36,9 +36,8 @@ function hydratePosixPath(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): vo
 
   const shellPath = shellEnvironment.PATH;
   const launchctlPath = platform === "darwin" && !shellPath ? readPathFromLaunchctl() : undefined;
-  const knownCliPath = resolveKnownPosixCliDirs(env, platform).join(":");
   const mergedPath = mergePathEntries(
-    shellPath ?? launchctlPath ?? knownCliPath,
+    shellPath ?? launchctlPath ?? resolveKnownPosixCliDirs(env, platform).join(":"),
     env.PATH,
     platform,
   );

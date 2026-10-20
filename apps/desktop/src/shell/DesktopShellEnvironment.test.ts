@@ -455,7 +455,7 @@ describe("DesktopShellEnvironment", () => {
 
       assert.equal(
         env.PATH,
-        "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/Users/test/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "/opt/homebrew/bin:/usr/local/bin:/Users/test/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
       );
     }),
   );

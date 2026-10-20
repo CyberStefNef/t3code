@@ -830,19 +830,19 @@ export function resolveKnownWindowsCliDirs(env: NodeJS.ProcessEnv): ReadonlyArra
   ];
 }
 
-// Both PATH probes can come back empty: a slow profile trips the login-shell timeout, and
-// `launchctl getenv PATH` is unset on recent macOS. That leaves a GUI launch on the bare
-// `/usr/bin:/bin:/usr/sbin:/sbin` PATH where no user-installed CLI can be spawned.
+// Last resort when both PATH probes come back empty: a slow profile trips the
+// login-shell timeout, and `launchctl getenv PATH` is unset on recent macOS, which
+// leaves a Finder launch on the bare `/usr/bin:/bin:/usr/sbin:/sbin` PATH.
 export function resolveKnownPosixCliDirs(
   env: NodeJS.ProcessEnv,
   platform: NodeJS.Platform,
 ): ReadonlyArray<string> {
   const home = env.HOME?.trim();
-  const homeDirs = home ? [`${home}/.local/bin`] : [];
-
-  return platform === "darwin"
-    ? ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", ...homeDirs]
-    : ["/home/linuxbrew/.linuxbrew/bin", "/usr/local/bin", ...homeDirs];
+  return [
+    ...(platform === "darwin" ? ["/opt/homebrew/bin"] : ["/home/linuxbrew/.linuxbrew/bin"]),
+    "/usr/local/bin",
+    ...(home ? [`${home}/.local/bin`] : []),
+  ];
 }
 
 function readWindowsEnvironmentSafely(
