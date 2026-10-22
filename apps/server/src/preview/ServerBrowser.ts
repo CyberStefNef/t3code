@@ -549,6 +549,7 @@ const make = Effect.gen(function* () {
       .send("Page.getNavigationHistory")
       .catch(() => null)
       .then((history) => {
+        if (tab.closing) return;
         const index = history?.currentIndex ?? 0;
         const count = history?.entries.length ?? 0;
         runFork(
@@ -667,8 +668,8 @@ const make = Effect.gen(function* () {
     tabs.delete(key);
     tab.closing = true;
     clearAbortedNavigation(tab);
-    // A desktop page outlives the connection unless its session closed with it.
-    const end = tab.desktop && !closeSession && sessionOpen(tab) ? "reconnect" : "gone";
+    // Replacing a page keeps its session and reconnects streamed clients to the new page.
+    const end = !closeSession && sessionOpen(tab) ? "reconnect" : "gone";
     for (const viewer of tab.viewers) viewer.push({ _tag: end });
     void tab.control.close().catch(constVoid);
     if (tab.desktop) void tab.desktop.close().catch(constVoid);
@@ -2476,12 +2477,24 @@ const make = Effect.gen(function* () {
   yield* desktopChannel.attached.pipe(
     Stream.runForEach((key) =>
       Effect.gen(function* () {
-        if (tabs.has(tabKey(key.threadId, key.tabId))) return;
+        const id = tabKey(key.threadId, key.tabId);
+        const pending = pendingTabs.get(id);
+        if (pending) yield* Effect.promise(() => pending.catch(constVoid));
+        const current = tabs.get(id);
+        if (current?.desktop) return;
         const { sessions } = yield* manager.list({ threadId: ThreadId.make(key.threadId) });
         const snapshot = sessions.find(
           (session) => session.tabId === key.tabId && session.runtime === "server",
         );
-        if (snapshot) yield* Effect.promise(() => ensureTab(snapshot).catch(constVoid));
+        if (!snapshot) return;
+        // The desktop can arrive after the attach timeout created a headless fallback.
+        // Its visible page and login state must become the agent's page as well.
+        if (current) dropTab(current, false);
+        yield* Effect.promise(() =>
+          ensureTab(snapshot)
+            .then((tab) => (tab.desktop ? reportLoaded(tab) : undefined))
+            .catch(constVoid),
+        );
       }).pipe(Effect.ignore),
     ),
     Effect.forkScoped,

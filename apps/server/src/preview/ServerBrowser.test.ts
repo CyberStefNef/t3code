@@ -52,7 +52,8 @@ vi.mock("./ServerBrowserContexts.ts", () => ({
       return makeContext().page as unknown as Page;
     }
     async connectDesktopPage(endpoint: string) {
-      const context = makeContext();
+      const context = nextDesktopContext ?? makeContext();
+      nextDesktopContext = null;
       desktopConnections.push({ endpoint, context });
       return { browser: { close: async () => {} }, page: context.page as unknown as Page };
     }
@@ -221,6 +222,7 @@ let focusedFrame: ReturnType<typeof makeFrame> | null = null;
 let contextFailure: Error | null = null;
 let initialNavigation: (() => Promise<void>) | null = null;
 let desktopRendersNext = false;
+let nextDesktopContext: ReturnType<typeof makeContext> | null = null;
 const desktopDetaches = new NodeEvents.EventEmitter();
 const desktopTabs = new Set<string>();
 const desktopRenders = (tabId: string) => {
@@ -329,6 +331,7 @@ beforeEach(() => {
   focusedFrame = null;
   desktopTabs.clear();
   desktopRendersNext = false;
+  nextDesktopContext = null;
   releasedDesktopTabs.length = 0;
   desktopConnections.length = 0;
 });
@@ -1144,6 +1147,57 @@ it.live(
           _tag: "PreviewAutomationExecutionError",
           reason:
             'No browser profile is named "Personal". Use one of: Default (id default), Incognito (id incognito), Work (id profile-work).',
+        });
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "a late desktop attachment replaces the login fallback with the visible signed-in page",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { broker, tabId, browser } = yield* ready;
+        const manager = yield* Manager.PreviewManager;
+        const fallback = contexts[0]!;
+        yield* Effect.promise(() => fallback.page.goto("https://example.test/login"));
+        const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+        const desktop = makeContext();
+        yield* Effect.promise(() => desktop.page.goto("https://example.test/account"));
+        nextDesktopContext = desktop;
+        desktopTabs.add(tabId);
+
+        const processed = Promise.withResolvers<void>();
+        const originalList = manager.list;
+        using _listed = vi.spyOn(manager, "list").mockImplementation((input) =>
+          originalList(input).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                if (input.threadId === "attachment-barrier") processed.resolve();
+              }),
+            ),
+          ),
+        );
+        desktopDetaches.emit("attach", { threadId: scope.thread.threadId, tabId });
+        desktopDetaches.emit("attach", { threadId: "attachment-barrier", tabId: "sentinel" });
+        yield* Effect.promise(() => processed.promise);
+
+        expect(desktopConnections).toHaveLength(1);
+        expect(fallback.page.isClosed()).toBe(true);
+        expect(desktop.page.isClosed()).toBe(false);
+        const output = yield* Queue.takeAll(viewer.output);
+        expect(output).toContainEqual({ _tag: "reconnect" });
+        const status = yield* broker.invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "status",
+          input: {},
+          tabId,
+        });
+        expect(status.url).toBe("https://example.test/account");
+        const { sessions } = yield* manager.list({ threadId: scope.thread.threadId });
+        expect(sessions.find((session) => session.tabId === tabId)?.navStatus).toMatchObject({
+          _tag: "Success",
+          url: "https://example.test/account",
         });
       }),
     ).pipe(Effect.provide(layer)),
