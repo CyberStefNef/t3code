@@ -95,6 +95,12 @@ import {
   type PullRequestRef,
   WS_METHODS,
   WsRpcGroup,
+  RpcScopeAuthorization,
+  WsSourceControlGetGitHubAccountRpc,
+  WsSourceControlSetGitHubAccountRpc,
+  WsSourceControlStartGitHubLoginRpc,
+  WsSourceControlGetGitHubLoginStatusRpc,
+  WsSourceControlLogoutGitHubAccountRpc,
 } from "@t3tools/contracts";
 import {
   HttpRouter,
@@ -102,7 +108,7 @@ import {
   HttpServerRespondable,
   HttpServerResponse,
 } from "effect/http";
-import { RpcSerialization, RpcServer } from "effect/rpc";
+import { RpcGroup, RpcSerialization, RpcServer } from "effect/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as ServerConfig from "./config.ts";
@@ -545,6 +551,42 @@ const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 
 // Middleware added later wraps middleware added earlier, so instrumentation wraps authorization.
 const ServerWsRpcGroup = WsRpcGroup.middleware(RpcInstrumentation);
+const ServerCoreWsRpcGroup = ServerWsRpcGroup.omit(
+  WS_METHODS.sourceControlGetGitHubAccount,
+  WS_METHODS.sourceControlSetGitHubAccount,
+  WS_METHODS.sourceControlStartGitHubLogin,
+  WS_METHODS.sourceControlGetGitHubLoginStatus,
+  WS_METHODS.sourceControlLogoutGitHubAccount,
+);
+const ServerGitHubAccountRpcGroup = RpcGroup.make(
+  WsSourceControlGetGitHubAccountRpc,
+  WsSourceControlSetGitHubAccountRpc,
+  WsSourceControlStartGitHubLoginRpc,
+  WsSourceControlGetGitHubLoginStatusRpc,
+  WsSourceControlLogoutGitHubAccountRpc,
+)
+  .middleware(RpcScopeAuthorization)
+  .middleware(RpcInstrumentation);
+
+// A separate handler layer keeps tsc-rs from inferring any for the combined RPC requirements.
+const layerGitHubAccountRpc = ServerGitHubAccountRpcGroup.toLayer(
+  Effect.map(
+    SourceControlRepositoryService.SourceControlRepositoryService,
+    (sourceControlRepositories) => ({
+      [WS_METHODS.sourceControlGetGitHubAccount]: (input) =>
+        sourceControlRepositories.getGitHubAccount(input),
+      [WS_METHODS.sourceControlSetGitHubAccount]: (input) =>
+        sourceControlRepositories.setGitHubAccount(input),
+      [WS_METHODS.sourceControlStartGitHubLogin]: (_input) =>
+        sourceControlRepositories.startGitHubLogin,
+      [WS_METHODS.sourceControlGetGitHubLoginStatus]: (input) =>
+        sourceControlRepositories.getGitHubLoginStatus(input),
+      [WS_METHODS.sourceControlLogoutGitHubAccount]: (input) =>
+        sourceControlRepositories.logoutGitHubAccount(input),
+    }),
+  ),
+);
+
 // Replaying each intervening event costs a shell refetch; past this gap a
 // single O(active-threads) snapshot is cheaper and bounded.
 const SHELL_RESUME_MAX_GAP = 1_000;
@@ -1188,7 +1230,7 @@ export const layerWsRpc = (
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
   serverBrowser: ServerBrowser.ServerBrowser["Service"],
 ) =>
-  ServerWsRpcGroup.toLayer(
+  ServerCoreWsRpcGroup.toLayer(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
       const sql = yield* SqlClient.SqlClient;
@@ -1804,7 +1846,7 @@ export const layerWsRpc = (
         return result;
       });
 
-      const handlers = ServerWsRpcGroup.of({
+      const handlers = ServerCoreWsRpcGroup.of({
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
           Effect.annotateCurrentSpan({
             "orchestration_v2.command_id": command.commandId,
@@ -2610,16 +2652,6 @@ export const layerWsRpc = (
             Effect.tap(() => repositoryIdentityResolver.resolve(input.cwd, { refresh: true })),
             Effect.tap(() => refreshGitStatus(input.cwd)),
           ),
-        [WS_METHODS.sourceControlGetGitHubAccount]: (input) =>
-          sourceControlRepositories.getGitHubAccount(input),
-        [WS_METHODS.sourceControlSetGitHubAccount]: (input) =>
-          sourceControlRepositories.setGitHubAccount(input),
-        [WS_METHODS.sourceControlStartGitHubLogin]: (_input) =>
-          sourceControlRepositories.startGitHubLogin,
-        [WS_METHODS.sourceControlGetGitHubLoginStatus]: (input) =>
-          sourceControlRepositories.getGitHubLoginStatus(input),
-        [WS_METHODS.sourceControlLogoutGitHubAccount]: (input) =>
-          sourceControlRepositories.logoutGitHubAccount(input),
         [WS_METHODS.projectsSearchEntries]: (input) =>
           workspaceEntries.search(input).pipe(
             Effect.mapError(
@@ -3136,7 +3168,7 @@ export const layerWsRpc = (
       });
       return handlers;
     }),
-  );
+  ).pipe(Layer.merge(layerGitHubAccountRpc));
 
 // RpcServer's default sends a socket-level Defect frame instead, and the client
 // ends every pending request on the socket with it.
