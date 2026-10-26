@@ -2,11 +2,12 @@ import type {
   ChatAttachment,
   OrchestrationV2ProjectedTurnItem,
   OrchestrationV2ProviderCapabilities,
-  OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
 import { copySorted } from "@t3tools/shared/Array";
 
-type Projection = OrchestrationV2ThreadProjection;
+import type { ThreadStructure } from "./models.ts";
+
+type Projection = ThreadStructure;
 type Run = Projection["runs"][number];
 type Message = Projection["messages"][number];
 type ProviderSession = Projection["providerSessions"][number];
@@ -142,7 +143,8 @@ export function deriveThreadQueueWorkflowState(projection: Projection): ThreadQu
     const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
     return {
       run,
-      text: message?.text ?? "Queued message",
+      // A queued guest message shows the guest's words; the agent still gets the attributed text.
+      text: message?.context?.guest?.text ?? message?.text ?? "Queued message",
       attachments: message?.attachments ?? [],
       messageId: run.userMessageId,
       ...(message?.context ? { context: message.context } : {}),

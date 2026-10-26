@@ -73,8 +73,8 @@ import { toastManager } from "../ui/toast";
 
 import { GitIcon, JujutsuIcon, type Icon } from "../Icons";
 import { SourceControlHostSettings } from "./SourceControlHostSettings";
-import { GitHubAccountSettings } from "./GitHubAccountSettings";
-import { GitHubTokenSettings } from "./GitHubTokenSettings";
+import { SourceControlAccountSettings } from "./SourceControlAccountSettings";
+import { SourceControlTokenSettings } from "./SourceControlTokenSettings";
 import { RedactedSensitiveText } from "./RedactedSensitiveText";
 import { SourceControlWritingSettingsSection } from "./SourceControlWritingSettings";
 import {
@@ -380,6 +380,7 @@ function GitHubAccounts({
   const [loginError, setLoginError] = useState<string | null>(null);
   const [logoutPending, setLogoutPending] = useState<string | null>(null);
 
+  // oxlint-disable-next-line t3code/react-effect-budget -- Poll the external login process while its dialog is open and stop when it closes.
   useEffect(() => {
     if (!loginOpen || !login) return;
     let disposed = false;
@@ -625,12 +626,10 @@ function DiscoveryItemRow({
   const [isExpanded, setIsExpanded] = useState(false);
   const hasDetails = children !== undefined;
   const searchTargetId = useSettingsSearchTargetId();
-  // A search jump to a setting inside this row opens it when the target arrives.
   const [seenSearchTargetId, setSeenSearchTargetId] = useState<string | null>(null);
   const targetsThisRow =
     (item.kind === "git" && searchTargetId === searchableSetting("git-fetch-interval").id) ||
-    searchTargetId === sourceControlHostSettingsSearchId(item.kind) ||
-    (item.kind === "github" && searchTargetId === searchableSetting("github-accounts").id);
+    searchTargetId === sourceControlHostSettingsSearchId(item.kind);
   if (targetsThisRow && !isExpanded && seenSearchTargetId !== searchTargetId) {
     setIsExpanded(true);
   }
@@ -875,13 +874,45 @@ export function SourceControlSettingsPanel() {
   const handleScan = () => {
     discovery.refresh();
   };
-  const hostSettingsPanel = (kind: string) => {
-    const definition = sourceControlClients.find(kind);
+  const hostSettingsPanel = (item: SourceControlProviderDiscoveryItem) => {
+    const definition = sourceControlClients.find(item.kind);
     if (!definition?.settings || environmentId === null) return undefined;
+    const { credentials } = definition;
+    if (credentials) {
+      return (
+        <SettingsSearchTarget id={sourceControlHostSettingsSearchId(item.kind)}>
+          <div className="grid gap-6">
+            <SourceControlTokenSettings
+              key={`token-${environmentId}`}
+              environmentId={environmentId}
+              definition={definition}
+              credentials={credentials}
+              onSaved={handleScan}
+            />
+            {item.kind === "github" ? (
+              <GitHubAccounts
+                auth={item.auth}
+                environmentId={environmentId}
+                onRefresh={handleScan}
+              />
+            ) : null}
+            {item.status === "available" ? (
+              <SourceControlAccountSettings
+                key={environmentId}
+                environmentId={environmentId}
+                definition={definition}
+                credentials={credentials}
+                auth={item.auth}
+                onSaved={handleScan}
+              />
+            ) : null}
+          </div>
+        </SettingsSearchTarget>
+      );
+    }
     return (
-      <SettingsSearchTarget id={sourceControlHostSettingsSearchId(kind)}>
+      <SettingsSearchTarget id={sourceControlHostSettingsSearchId(item.kind)}>
         <SourceControlHostSettings
-          // Drafts belong to one environment; switching must not carry them over.
           key={environmentId}
           environmentId={environmentId}
           definition={{ ...definition, settings: definition.settings }}
@@ -924,7 +955,7 @@ export function SourceControlSettingsPanel() {
             title={`Version Control${environmentSuffix}`}
             headerAction={scanButton}
           />
-          <SourceControlSectionSkeleton title="Source Control Providers" />
+          <SourceControlSectionSkeleton title="Source control providers" />
         </>
       ) : hasDiscoveryItems ? (
         <>
@@ -947,42 +978,14 @@ export function SourceControlSettingsPanel() {
               id={hasVersionControlSystems ? undefined : searchableSetting("source-control").id}
               title={
                 hasVersionControlSystems
-                  ? "Source Control Providers"
-                  : `Source Control Providers${environmentSuffix}`
+                  ? "Source control providers"
+                  : `Source control providers${environmentSuffix}`
               }
               headerAction={hasVersionControlSystems ? null : scanButton}
             >
               {result.sourceControlProviders.map((item) => (
                 <DiscoveryItemRow key={`provider:${item.kind}`} item={item}>
-                  {item.kind === "github" ? (
-                    <SettingsSearchTarget id={searchableSetting("github-accounts").id}>
-                      <div className="grid gap-6">
-                        {}
-                        <GitHubTokenSettings
-                          key={`token-${environmentId}`}
-                          environmentId={environmentId}
-                          onSaved={handleScan}
-                        />
-                        {environmentId !== null ? (
-                          <GitHubAccounts
-                            auth={item.auth}
-                            environmentId={environmentId}
-                            onRefresh={handleScan}
-                          />
-                        ) : null}
-                        {item.status === "available" ? (
-                          <GitHubAccountSettings
-                            key={environmentId}
-                            environmentId={environmentId}
-                            auth={item.auth}
-                            onSaved={handleScan}
-                          />
-                        ) : null}
-                      </div>
-                    </SettingsSearchTarget>
-                  ) : (
-                    hostSettingsPanel(item.kind)
-                  )}
+                  {hostSettingsPanel(item)}
                 </DiscoveryItemRow>
               ))}
             </SettingsSection>

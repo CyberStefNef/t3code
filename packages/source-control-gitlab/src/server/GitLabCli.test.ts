@@ -167,14 +167,12 @@ layer("GitLabCli.layer", (it) => {
 
   it.effect("reduces a repository given as a URL to the project path it names", () =>
     Effect.gen(function* () {
-      const repositoryJson =
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
-        JSON.stringify({
-          path_with_namespace: "group/subgroup/project",
-          web_url: "https://sourcecontrol.example.com/group/subgroup/project",
-          http_url_to_repo: "https://sourcecontrol.example.com/group/subgroup/project.git",
-          ssh_url_to_repo: "git@sourcecontrol.example.com:group/subgroup/project.git",
-        });
+      const repositoryJson = JSON.stringify({
+        path_with_namespace: "group/subgroup/project",
+        web_url: "https://sourcecontrol.example.com/group/subgroup/project",
+        http_url_to_repo: "https://sourcecontrol.example.com/group/subgroup/project.git",
+        ssh_url_to_repo: "git@sourcecontrol.example.com:group/subgroup/project.git",
+      });
       const project = "projects/group%2Fsubgroup%2Fproject";
 
       const cases: ReadonlyArray<readonly [string, string]> = [
@@ -212,7 +210,6 @@ layer("GitLabCli.layer", (it) => {
   it.effect("drops the relative URL root of an instance hosted under a subfolder", () =>
     Effect.gen(function* () {
       mockRepository(
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
         JSON.stringify({
           path_with_namespace: "group/project",
           web_url: "https://example.com/gitlab/group/project",
@@ -247,7 +244,6 @@ layer("GitLabCli.layer", (it) => {
     Effect.gen(function* () {
       for (const host of ["example.com/gitlab", "https://example.com/gitlab"]) {
         mockRepository(
-          // @effect-diagnostics-next-line preferSchemaOverJson:off
           JSON.stringify({
             path_with_namespace: "group/subgroup/project",
             web_url: "https://example.com/gitlab/group/subgroup/project",
@@ -276,7 +272,6 @@ layer("GitLabCli.layer", (it) => {
   it.effect("reads the relative URL root under the port the instance is served on", () =>
     Effect.gen(function* () {
       mockRepository(
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
         JSON.stringify({
           path_with_namespace: "group/project",
           web_url: "https://example.com:8443/gitlab/group/project",
@@ -309,7 +304,6 @@ layer("GitLabCli.layer", (it) => {
   it.effect("keeps a leading segment when the configured root belongs to another host", () =>
     Effect.gen(function* () {
       mockRepository(
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
         JSON.stringify({
           path_with_namespace: "gitlab/group/project",
           web_url: "https://gitlab.com/gitlab/group/project",
@@ -336,7 +330,6 @@ layer("GitLabCli.layer", (it) => {
   it.effect("keeps a root that would leave a project without its namespace", () =>
     Effect.gen(function* () {
       mockRepository(
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
         JSON.stringify({
           path_with_namespace: "group/project",
           web_url: "https://example.com/group/project",
@@ -362,7 +355,6 @@ layer("GitLabCli.layer", (it) => {
   it.effect("asks for a bare project path without reading any config", () =>
     Effect.gen(function* () {
       mockRepository(
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
         JSON.stringify({
           path_with_namespace: "group/subgroup/project",
           web_url: "https://gitlab.com/group/subgroup/project",
@@ -384,7 +376,6 @@ layer("GitLabCli.layer", (it) => {
   it.effect("accepts a project served on a non-default port", () =>
     Effect.gen(function* () {
       mockRepository(
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
         JSON.stringify({
           path_with_namespace: "group/project",
           web_url: "https://sourcecontrol.example.com:8443/group/project",
@@ -406,7 +397,6 @@ layer("GitLabCli.layer", (it) => {
   it.effect("refuses a project served on a different port than the URL named", () =>
     Effect.gen(function* () {
       mockRepository(
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
         JSON.stringify({
           path_with_namespace: "group/project",
           web_url: "https://sourcecontrol.example.com/group/project",
@@ -431,7 +421,6 @@ layer("GitLabCli.layer", (it) => {
   it.effect("refuses a project resolved on a host the URL did not name", () =>
     Effect.gen(function* () {
       mockRepository(
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
         JSON.stringify({
           path_with_namespace: "group/project",
           web_url: "https://gitlab.com/group/project",

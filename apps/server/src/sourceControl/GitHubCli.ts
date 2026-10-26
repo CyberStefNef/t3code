@@ -584,16 +584,7 @@ const decodePullRequestsByHead = decodeJsonResult(
   }),
 );
 
-/**
- * The repository `gh pr list` reads in a checkout, picked the way gh picks one without a
- * prompt: the remote `gh repo set-default` marked, else the first of upstream, github, origin
- * (in any case), else the only remote. `remotes` is `git remote -v` output and `resolved` is the output of
- * `git config --get-regexp '^remote\..*\.gh-resolved$'`.
- *
- * Null whenever gh might weigh the remotes differently: a remote on another host or under an
- * SSH alias, more than one mark, or several remotes with none of those names. Callers then
- * ask gh itself.
- */
+// Match gh's marked base or preferred remote; ambiguous hosts and aliases fall back to gh.
 export function selectGitHubBaseRepository(input: {
   readonly remotes: string;
   readonly resolved: string;
@@ -632,7 +623,7 @@ export function selectGitHubBaseRepository(input: {
     : null;
 }
 
-/** @public Service construction is part of the canonical Effect module API. */
+/** @public */
 export const make = Effect.gen(function* () {
   const vcsProcess = yield* VcsProcess.VcsProcess;
   const spawner = yield* Effect.serviceOption(ChildProcessSpawner.ChildProcessSpawner);
@@ -1241,67 +1232,62 @@ export const make = Effect.gen(function* () {
    * the document with `rateLimit` added, so a GraphQL read can report what it spent; a CLI read
    * ignores it and is priced at one point.
    */
-  const guardedRead = <A>(input: {
+  const guardedRead = Effect.fn("GitHubCli.guardedRead")(function* <A>(input: {
     readonly cwd: string;
     readonly host: string;
     readonly document: string;
     readonly allowReserve: boolean;
     readonly run: (document: string) => Effect.Effect<A, GitHubCliError>;
-  }) =>
-    Effect.gen(function* () {
-      const credential = yield* PinnedGitHubCredential;
-      const selectedEnv = yield* SelectedAccountEnv;
-      const selectedToken = selectedEnv?.GH_TOKEN ?? selectedEnv?.GITHUB_TOKEN;
-      const fingerprint =
-        credential?.credentialFingerprint ??
-        (selectedToken
-          ? `${input.host}:${yield* crypto.digest("SHA-256", new TextEncoder().encode(selectedToken)).pipe(Effect.map(Hex.encode), Effect.orDie)}`
-          : "");
-      const key = { provider: SourceControlProviderKind.make("github"), host: input.host };
-      const guarded = Effect.gen(function* () {
-        const lease = yield* limits.check(
-          key,
-          input.allowReserve ? { allowPaused: true } : undefined,
-        );
-        // A failed reading leaves the budget unknown; it never blocks the read itself.
-        yield* Cache.get(
-          budgetReading,
-          `${input.host}\0${yield* SourceControlRateLimit.CredentialScope}`,
-        ).pipe(Effect.ignore);
-        return yield* budget
-          .query(
-            input.host,
-            input.document,
-            input.allowReserve ? { allowReserve: true } : undefined,
-          )
-          .pipe(
-            Effect.flatMap(input.run),
-            Effect.tap(() => limits.recordSuccess({ ...key, lease })),
-            Effect.tapError((error) =>
-              error._tag === "GitHubCliRateLimitError"
-                ? limits.recordRateLimit({ ...key, lease })
-                : Effect.void,
-            ),
-          );
-      });
-      return yield* guarded.pipe(
-        Effect.provideService(
-          SourceControlRateLimit.CredentialScope,
-          fingerprint || (yield* SourceControlRateLimit.CredentialScope),
-        ),
-        Effect.catchTags({
-          SourceControlRateLimitPausedError: (cause) =>
-            Effect.fail(
-              new GitHubCliRateLimitError({
-                command: "gh",
-                cwd: input.cwd,
-                retryAt: cause.retryAt,
-                cause,
-              }),
-            ),
-        }),
+  }) {
+    const credential = yield* PinnedGitHubCredential;
+    const selectedEnv = yield* SelectedAccountEnv;
+    const selectedToken = selectedEnv?.GH_TOKEN ?? selectedEnv?.GITHUB_TOKEN;
+    const fingerprint =
+      credential?.credentialFingerprint ??
+      (selectedToken
+        ? `${input.host}:${yield* crypto.digest("SHA-256", new TextEncoder().encode(selectedToken)).pipe(Effect.map(Hex.encode), Effect.orDie)}`
+        : "");
+    const key = { provider: SourceControlProviderKind.make("github"), host: input.host };
+    const guarded = Effect.gen(function* () {
+      const lease = yield* limits.check(
+        key,
+        input.allowReserve ? { allowPaused: true } : undefined,
       );
+      // A failed reading leaves the budget unknown; it never blocks the read itself.
+      yield* Cache.get(
+        budgetReading,
+        `${input.host}\0${yield* SourceControlRateLimit.CredentialScope}`,
+      ).pipe(Effect.ignore);
+      return yield* budget
+        .query(input.host, input.document, input.allowReserve ? { allowReserve: true } : undefined)
+        .pipe(
+          Effect.flatMap(input.run),
+          Effect.tap(() => limits.recordSuccess({ ...key, lease })),
+          Effect.tapError((error) =>
+            error._tag === "GitHubCliRateLimitError"
+              ? limits.recordRateLimit({ ...key, lease })
+              : Effect.void,
+          ),
+        );
     });
+    return yield* guarded.pipe(
+      Effect.provideService(
+        SourceControlRateLimit.CredentialScope,
+        fingerprint || (yield* SourceControlRateLimit.CredentialScope),
+      ),
+      Effect.catchTags({
+        SourceControlRateLimitPausedError: (cause) =>
+          Effect.fail(
+            new GitHubCliRateLimitError({
+              command: "gh",
+              cwd: input.cwd,
+              retryAt: cause.retryAt,
+              cause,
+            }),
+          ),
+      }),
+    );
+  });
 
   const executeWithEnv: GitHubCli["Service"]["execute"] = Effect.fn("GitHubCli.execute")(
     function* (input) {
@@ -1525,8 +1511,8 @@ export const make = Effect.gen(function* () {
     beginLogin,
     getLoginStatus,
     logoutAccount,
-    listOpenPullRequests: (input) =>
-      execute({
+    listOpenPullRequests: Effect.fn("GitHubCli.listOpenPullRequests")(function (input) {
+      return execute({
         cwd: input.cwd,
         ...(input.rateLimitHost === undefined ? {} : { rateLimitHost: input.rateLimitHost }),
         allowReserve: true,
@@ -1563,9 +1549,10 @@ export const make = Effect.gen(function* () {
                 }),
               ),
         ),
-      ),
-    getPullRequest: (input) =>
-      execute({
+      );
+    }),
+    getPullRequest: Effect.fn("GitHubCli.getPullRequest")(function (input) {
+      return execute({
         cwd: input.cwd,
         ...(input.rateLimitHost === undefined ? {} : { rateLimitHost: input.rateLimitHost }),
         allowReserve: true,
@@ -1595,9 +1582,10 @@ export const make = Effect.gen(function* () {
             }),
           ),
         ),
-      ),
-    getRepositoryCloneUrls: (input) =>
-      execute({
+      );
+    }),
+    getRepositoryCloneUrls: Effect.fn("GitHubCli.getRepositoryCloneUrls")(function (input) {
+      return execute({
         cwd: input.cwd,
         ...(input.account ? { account: input.account } : {}),
         args: ["repo", "view", input.repository, "--json", "nameWithOwner,url,sshUrl"],
@@ -1616,9 +1604,10 @@ export const make = Effect.gen(function* () {
           ),
         ),
         Effect.map(normalizeRepositoryCloneUrls),
-      ),
-    createRepository: (input) =>
-      execute({
+      );
+    }),
+    createRepository: Effect.fn("GitHubCli.createRepository")(function (input) {
+      return execute({
         cwd: input.cwd,
         ...(input.account ? { account: input.account } : {}),
         args: ["repo", "create", input.repository, `--${input.visibility}`],
@@ -1626,9 +1615,10 @@ export const make = Effect.gen(function* () {
         Effect.map((result) =>
           deriveRepositoryCloneUrlsFromCreateOutput(result.stdout, input.repository),
         ),
-      ),
-    createPullRequest: (input) =>
-      execute({
+      );
+    }),
+    createPullRequest: Effect.fn("GitHubCli.createPullRequest")(function (input) {
+      return execute({
         cwd: input.cwd,
         args: [
           "pr",
@@ -1642,9 +1632,10 @@ export const make = Effect.gen(function* () {
           "--body-file",
           input.bodyFile,
         ],
-      }).pipe(Effect.asVoid),
-    getDefaultBranch: (input) =>
-      execute({
+      }).pipe(Effect.asVoid);
+    }),
+    getDefaultBranch: Effect.fn("GitHubCli.getDefaultBranch")(function (input) {
+      return execute({
         cwd: input.cwd,
         ...(input.rateLimitHost === undefined ? {} : { rateLimitHost: input.rateLimitHost }),
         args: ["repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"],
@@ -1653,12 +1644,14 @@ export const make = Effect.gen(function* () {
           const trimmed = value.stdout.trim();
           return trimmed.length > 0 ? trimmed : null;
         }),
-      ),
-    checkoutPullRequest: (input) =>
-      execute({
+      );
+    }),
+    checkoutPullRequest: Effect.fn("GitHubCli.checkoutPullRequest")(function (input) {
+      return execute({
         cwd: input.cwd,
         args: ["pr", "checkout", input.reference, ...(input.force ? ["--force"] : [])],
-      }).pipe(Effect.asVoid),
+      }).pipe(Effect.asVoid);
+    }),
   });
 });
 
