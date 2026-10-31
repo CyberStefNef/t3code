@@ -1,3 +1,4 @@
+import { normalizeHost } from "@t3tools/source-control-core/server/pullRequestUtils";
 import * as Cache from "effect/Cache";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -34,7 +35,7 @@ export const RepositoryAccount = Context.Reference<{
   readonly account?: string;
 } | null>("@t3tools/source-control-github/RepositoryAccount", { defaultValue: () => null });
 
-export const GitHubCredentialSource = Schema.Literals(["settings", "env", "gh"]);
+export const GitHubCredentialSource = Schema.Literals(["settings", "app", "env", "gh"]);
 export type GitHubCredentialSource = typeof GitHubCredentialSource.Type;
 
 export interface GitHubCredential {
@@ -94,12 +95,21 @@ export class GitHubCredentials extends Context.Service<
     readonly get: (
       host: string,
     ) => Effect.Effect<GitHubCredential, GitHubCredentialUnavailableError>;
+    /** The token saved in Settings for `host`, which outranks every other source. */
+    readonly saved: (
+      host: string,
+    ) => Effect.Effect<Option.Option<GitHubCredential>, GitHubCredentialUnavailableError>;
+    readonly fingerprint: (host: string, token: string) => Effect.Effect<string>;
     readonly invalidate: (host: string) => Effect.Effect<void>;
   }
 >()("@t3tools/source-control-github/server/GitHubCredentials") {}
 
-function normalizeHost(host: string): string {
-  return host.trim().toLowerCase();
+const HOSTNAME =
+  /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::\d{1,5})?$/;
+
+/** API URLs are built from the host text, so anything but a bare hostname could redirect a token. */
+export function isGitHubHost(host: string): boolean {
+  return HOSTNAME.test(host);
 }
 
 function isGitHubDotCom(host: string): boolean {
@@ -111,6 +121,7 @@ export function environmentToken(
   host: string,
   env: Readonly<Record<string, string | undefined>>,
 ): string | null {
+  if (!isGitHubHost(host)) return null;
   const names = isGitHubDotCom(host)
     ? ["GH_TOKEN", "GITHUB_TOKEN"]
     : env.GH_HOST?.trim().toLowerCase() === host
@@ -231,34 +242,62 @@ export const make = Effect.gen(function* () {
           : MISSING_TTL,
   });
 
+  const repositoryAccount = Effect.fn("GitHubCredentials.repositoryAccount")(function* (
+    host: string,
+  ) {
+    const repository = yield* RepositoryAccount;
+    let account = repository?.account;
+    if (repository !== null && account === undefined) {
+      const result = yield* process
+        .run({
+          operation: "GitHubCredentials.repositoryAccount",
+          command: "git",
+          args: ["config", "--get", "github.account"],
+          cwd: repository.cwd,
+          allowNonZeroExit: true,
+          timeoutMs: 5_000,
+        })
+        .pipe(Effect.mapError((cause) => new GitHubCliFailedError({ host, cause })));
+      if (result.exitCode !== 0 && result.exitCode !== 1) {
+        return yield* new GitHubCliFailedError({
+          host,
+          cause: new Error("Could not read the repository's GitHub account."),
+        });
+      }
+      account = result.stdout.trim() || undefined;
+    }
+    return account;
+  });
+
+  const saved = Effect.fn("GitHubCredentials.saved")(function* (rawHost: string) {
+    const host = normalizeHost(rawHost);
+    if (!isGitHubHost(host)) return yield* new GitHubNotSignedInError({ host });
+    if ((yield* hostChoice(host))?.enabled === false) {
+      return yield* new GitHubHostDisabledError({ host });
+    }
+    const account = yield* repositoryAccount(host);
+    if (account !== undefined) {
+      return Option.some(yield* Cache.get(cache, cacheKey(host, account, true)));
+    }
+    const token = yield* savedToken(host);
+    if (token === null) return Option.none<GitHubCredential>();
+    return Option.some<GitHubCredential>({
+      host,
+      token: Redacted.make(token),
+      source: "settings",
+      fingerprint: yield* fingerprintOf(host, token),
+    });
+  });
+
   return GitHubCredentials.of({
     get: Effect.fn("GitHubCredentials.get")(function* (rawHost) {
       const host = normalizeHost(rawHost);
+      if (!isGitHubHost(host)) return yield* new GitHubNotSignedInError({ host });
       const choice = yield* hostChoice(host);
       if (choice?.enabled === false) {
         return yield* new GitHubHostDisabledError({ host });
       }
-      const repository = yield* RepositoryAccount;
-      let account = repository?.account;
-      if (repository !== null && account === undefined) {
-        const result = yield* process
-          .run({
-            operation: "GitHubCredentials.repositoryAccount",
-            command: "git",
-            args: ["config", "--get", "github.account"],
-            cwd: repository.cwd,
-            allowNonZeroExit: true,
-            timeoutMs: 5_000,
-          })
-          .pipe(Effect.mapError((cause) => new GitHubCliFailedError({ host, cause })));
-        if (result.exitCode !== 0 && result.exitCode !== 1) {
-          return yield* new GitHubCliFailedError({
-            host,
-            cause: new Error("Could not read the repository's GitHub account."),
-          });
-        }
-        account = result.stdout.trim() || undefined;
-      }
+      const account = yield* repositoryAccount(host);
       // A project's deliberate choice overrides host-wide credentials.
       if (account === undefined) {
         // A token saved in Settings is the most deliberate choice, so it comes before the
@@ -278,6 +317,8 @@ export const make = Effect.gen(function* () {
         cacheKey(host, account ?? choice?.account, account !== undefined),
       );
     }),
+    saved,
+    fingerprint: fingerprintOf,
     // A refused token may be cached under either a project or host-wide account.
     invalidate: Effect.fn("GitHubCredentials.invalidate")(function () {
       return Cache.invalidateAll(cache);

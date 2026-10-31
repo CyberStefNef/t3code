@@ -82,8 +82,7 @@ function layer(input: {
           Effect.succeed({
             status: "pushed" as const,
             branch: "feature/remote-v1",
-            upstreamBranch: "origin/feature/remote-v1",
-            setUpstream: true,
+                  setUpstream: true,
           }),
         ...input.git,
       }),
@@ -429,6 +428,62 @@ it.effect.each([
   }),
 );
 
+it.effect.each([
+  ["a plain token", "s3cret"],
+  ["a token with an apostrophe", "s3'cret"],
+  ["a token with a double quote", 's3"cret'],
+  ["a host-only token with an at sign", "abc@secret"],
+  ["an unquoted token with an apostrophe", "s3'cret", true],
+  ["an unquoted token with a double quote", 's3"cret', true],
+  ["an unquoted URL with an apostrophe in its path", "path-token", true],
+] as const)("keeps %s in the query out of a failed clone's error text", ([, token, unquoted]) =>
+  Effect.gen(function* () {
+    const remote =
+      token === "abc@secret"
+        ? "https://github.com"
+        : token === "path-token"
+          ? "https://github.com/octocat/t3code's.git"
+          : "https://github.com/octocat/t3code.git";
+    const error = yield* Effect.flip(
+      cloneInTemporaryDirectory(
+        {
+          execute: (input) =>
+            Effect.gen(function* () {
+              const cloneUrl = input.args.at(-2)!;
+              // Git treats @ in a pathless URL's query as userinfo, losing the query delimiter.
+              const diagnosticUrl =
+                cloneUrl === "https://github.com?access_token=abc@secret"
+                  ? "https://secret"
+                  : cloneUrl;
+              yield* (
+                input.progress?.onStderrLine?.(
+                  unquoted
+                    ? `fatal: ${diagnosticUrl}/info/refs not valid: is this a git repository?`
+                    : `fatal: unable to access '${diagnosticUrl}/': Could not resolve host: github.com`,
+                ) ?? Effect.void
+              );
+              return yield* new GitCommandError({
+                operation: input.operation,
+                command: "git",
+                cwd: input.cwd,
+                detail: "Git command exited with a non-zero status.",
+                exitCode: 128,
+              });
+            }),
+        },
+        { remoteUrl: `${remote}?access_token=${token}` },
+      ),
+    );
+
+    assert.strictEqual(
+      error.detail,
+      unquoted
+        ? `fatal: ${remote} not valid: is this a git repository?`
+        : `fatal: unable to access '${remote}${token === "abc@secret" ? "/" : ""}': Could not resolve host: github.com`,
+    );
+  }),
+);
+
 it.effect("strips embedded credentials from the remote URL it reports", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -584,7 +639,6 @@ it.effect("pins the GitHub account before creating and publishing the repository
       remoteName: "origin",
       remoteUrl: CLONE_URLS.sshUrl,
       branch: "feature/remote-v1",
-      upstreamBranch: "origin/feature/remote-v1",
       status: "pushed",
     });
     assert.deepStrictEqual(createCalls, [
@@ -623,8 +677,7 @@ it.effect("pins the GitHub account before creating and publishing the repository
               return {
                 status: "pushed" as const,
                 branch: "feature/remote-v1",
-                upstreamBranch: "origin/feature/remote-v1",
-                setUpstream: true,
+                          setUpstream: true,
               };
             }),
         },
