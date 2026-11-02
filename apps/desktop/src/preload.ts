@@ -202,6 +202,7 @@ contextBridge.exposeInMainWorld("desktopBridge", {
   cancelProviderAuthCallback: (url: string) =>
     ipcRenderer.invoke(IpcChannels.CANCEL_PROVIDER_AUTH_CALLBACK_CHANNEL, url),
   openExternal: (url: string) => ipcRenderer.invoke(IpcChannels.OPEN_EXTERNAL_CHANNEL, url),
+  readMedia: (url: string) => ipcRenderer.invoke(IpcChannels.READ_MEDIA_CHANNEL, url),
   checkSystemPermission: (pane: string) =>
     ipcRenderer.invoke(IpcChannels.CHECK_SYSTEM_PERMISSION_CHANNEL, pane),
   openSystemSettings: (pane: string) =>
@@ -414,6 +415,17 @@ contextBridge.exposeInMainWorld("desktopBridge", {
       return () =>
         ipcRenderer.removeListener(IpcChannels.PREVIEW_STATE_CHANGE_CHANNEL, wrappedListener);
     },
+    onRenderActivity: (listener) => {
+      const wrappedListener = (
+        _event: Electron.IpcRendererEvent,
+        event: import("@t3tools/contracts").DesktopBrowserRenderActivity,
+      ) => listener(event);
+      ipcRenderer.on(IpcChannels.PREVIEW_RENDER_ACTIVITY_CHANNEL, wrappedListener);
+      return () =>
+        ipcRenderer.removeListener(IpcChannels.PREVIEW_RENDER_ACTIVITY_CHANNEL, wrappedListener);
+    },
+    acknowledgeRendering: (leaseId) =>
+      ipcRenderer.invoke(IpcChannels.PREVIEW_RENDER_READY_CHANNEL, leaseId),
     onPointerEvent: (listener) => {
       const wrappedListener = (_event: Electron.IpcRendererEvent, pointerEvent: unknown) => {
         if (typeof pointerEvent !== "object" || pointerEvent === null) return;

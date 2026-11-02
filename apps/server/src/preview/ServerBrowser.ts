@@ -273,6 +273,7 @@ interface EncoderWindow {
 }
 
 interface Recording {
+  readonly releaseRendering: () => Promise<void>;
   readonly encoder: Page;
   readonly session: CDPSession;
   readonly startedAt: string;
@@ -590,9 +591,15 @@ const make = Effect.gen(function* () {
     const url = tab.page.url();
     // Chromium's error page loads after `requestfailed` and must not clear LoadFailed.
     if (url === "about:blank" || url.startsWith("chrome-error://")) return;
+    // A navigation that starts and fails during the title read leaves the URL unchanged.
+    const generation = tab.navigationGeneration;
     const title = (await tab.page.title().catch(() => "")).slice(0, 512);
-    if (tab.loading || tab.page.url() !== url) return;
-    report(tab, { _tag: "Success", url: url.slice(0, 2048), title });
+    if (tab.navigationGeneration !== generation || tab.loading || tab.page.url() !== url) return;
+    report(tab, {
+      _tag: "Success",
+      url: ServerBrowserPage.withoutDataPayload(url).slice(0, 2048),
+      title,
+    });
   };
 
   const reportLiveTabs = () => {
@@ -733,7 +740,16 @@ const make = Effect.gen(function* () {
     if (tab.desktop) void tab.desktop.close().catch(constVoid);
     else void tab.page.close().catch(constVoid);
     if (tab.isolatedContext) void tab.page.context().close().catch(constVoid);
-    void tab.recording?.encoder.close().catch(constVoid);
+    if (tab.recording) {
+      const recording = tab.recording;
+      void Promise.all([
+        recording.session.detach().catch(constVoid),
+        recording.encoder.close().catch(constVoid),
+        ...recording.framesInFlight,
+      ])
+        .finally(recording.releaseRendering)
+        .catch(constVoid);
+    }
     void NodeFSP.rm(downloadDir(tab), { recursive: true, force: true }).catch(constVoid);
     reportLiveTabs();
     if (closeSession) {
@@ -985,6 +1001,8 @@ const make = Effect.gen(function* () {
     page.on("crash", () => dropTab(tab, true));
     tabs.set(key, tab);
     reportLiveTabs();
+    // A desktop page navigates on its own and can finish loading before these listeners attach.
+    if (desktop) void page.waitForLoadState("load").then(() => reportLoaded(tab), constVoid);
     // Existing desktop and popup PDFs can start loading before interception attaches.
     if (
       snapshot.navStatus._tag === "Loading" &&
@@ -1560,7 +1578,7 @@ const make = Effect.gen(function* () {
         ...profileStatus(),
       };
     }
-    const url = tab.page.url();
+    const url = ServerBrowserPage.withoutDataPayload(tab.page.url());
     const viewport = tab.desktop ? await layoutSize(tab) : tab.page.viewportSize();
     const status = {
       available: true,
@@ -1584,7 +1602,10 @@ const make = Effect.gen(function* () {
         .filter((candidate) => candidate.threadId === tab.threadId)
         .map((candidate) => ({
           tabId: candidate.tabId,
-          url: candidate.page.url() === "about:blank" ? null : candidate.page.url(),
+          url:
+            candidate.page.url() === "about:blank"
+              ? null
+              : ServerBrowserPage.withoutDataPayload(candidate.page.url()),
           ...(candidate.openerTabId === undefined ? {} : { openerTabId: candidate.openerTabId }),
           owner: tabOwner(candidate),
           ownedByCaller: candidate.control.agentId === agentSessionId,
@@ -1650,10 +1671,35 @@ const make = Effect.gen(function* () {
     });
   };
 
+  const acquireRendering = async (tab: ServerTab): Promise<() => Promise<void>> => {
+    if (!tab.desktop) return async () => {};
+    const scope = await runPromise(Scope.make());
+    const release = () => runPromise(Scope.close(scope, Exit.void));
+    try {
+      await runPromise(
+        desktopChannel
+          .rendering({ threadId: tab.threadId, tabId: tab.tabId })
+          .pipe(Scope.provide(scope)),
+      );
+      return release;
+    } catch (cause) {
+      await release();
+      throw cause;
+    }
+  };
+  const withRendering = async <A>(tab: ServerTab, operation: () => Promise<A>): Promise<A> => {
+    const release = await acquireRendering(tab);
+    try {
+      return await operation();
+    } finally {
+      await release();
+    }
+  };
+
   const withCaptureLock = <A>(tab: ServerTab, operation: () => Promise<A>): Promise<A> => {
     const run = tab.captureLock.then(() => {
       if (tab.closing) throw new Error("The preview tab closed.");
-      return operation();
+      return withRendering(tab, operation);
     });
     tab.captureLock = run.then(constVoid, constVoid);
     return run;
@@ -1662,7 +1708,14 @@ const make = Effect.gen(function* () {
   const startRecording = (tab: ServerTab): Promise<Recording> => {
     const started = withCaptureLock(tab, async () => {
       if (tab.recording) return tab.recording;
-      const encoder = await contexts.scratchPage();
+      const releaseRendering = await acquireRendering(tab);
+      let encoder: Page;
+      try {
+        encoder = await contexts.scratchPage();
+      } catch (cause) {
+        await releaseRendering();
+        throw cause;
+      }
       let session: CDPSession | null = null;
       try {
         await encoder.evaluate(ServerBrowserPage.recordingEncoderScript(recordingFrameRate));
@@ -1702,6 +1755,7 @@ const make = Effect.gen(function* () {
         await opened.send("Page.startScreencast", RECORDING_SCREENCAST);
         if (tab.closing) throw new Error("The tab closed while the recording started.");
         const recording: Recording = {
+          releaseRendering,
           encoder,
           session: opened,
           startedAt: new Date().toISOString(),
@@ -1712,6 +1766,7 @@ const make = Effect.gen(function* () {
       } catch (cause) {
         await encoder.close().catch(constVoid);
         await session?.detach().catch(constVoid);
+        await releaseRendering();
         throw cause;
       }
     }).finally(() => {
@@ -1721,8 +1776,14 @@ const make = Effect.gen(function* () {
     return started;
   };
 
-  const withScreencastsPaused = <A>(tab: ServerTab, capture: () => Promise<A>): Promise<A> =>
+  // Scaled captures repaint every screencast; pause them to avoid leaking that frame.
+  const withScreencastsPaused = <A>(
+    tab: ServerTab,
+    capture: () => Promise<A>,
+    checkDeadline: () => void,
+  ): Promise<A> =>
     withCaptureLock(tab, async () => {
+      checkDeadline();
       tab.capturing += 1;
       const recording = tab.recording;
       try {
@@ -1778,6 +1839,7 @@ const make = Effect.gen(function* () {
         }
       } finally {
         await recording.encoder.close().catch(constVoid);
+        await recording.releaseRendering();
         tab.recording = null;
       }
       const data = Buffer.concat(chunks);
@@ -1847,7 +1909,9 @@ const make = Effect.gen(function* () {
       startedAt: new Date().toISOString(),
     };
     pushBounded(tab.actionTimeline, event, ACTION_TIMELINE_LIMIT);
-    return run().then(
+    // Background guests otherwise remain offscreen during Playwright's layout
+    // and scroll checks, before any screenshot has had a chance to wake them.
+    return withRendering(tab, run).then(
       (result) => {
         event.status = "succeeded";
         event.completedAt = new Date().toISOString();
@@ -1907,6 +1971,7 @@ const make = Effect.gen(function* () {
   const runOperation = async (
     request: PreviewAutomationRequest,
     deadlineMs: number,
+    snapshotDeadline: number,
   ): Promise<unknown> => {
     const input = request.input;
     switch (request.operation) {
@@ -2090,7 +2155,7 @@ const make = Effect.gen(function* () {
             "A browser dialog is pending. Read preview_status.",
             "dialogPending",
           );
-        return executeTabOperation(tab, request);
+        return executeTabOperation(tab, request, snapshotDeadline);
       });
     }
     return tab.control.agent(
@@ -2105,7 +2170,7 @@ const make = Effect.gen(function* () {
         tab.agentOperating = !READ_OPERATIONS.has(request.operation);
         updateFileChooserInterception(tab);
         try {
-          return await executeTabOperation(tab, request);
+          return await executeTabOperation(tab, request, snapshotDeadline);
         } finally {
           tab.agentOperating = false;
           updateFileChooserInterception(tab);
@@ -2116,7 +2181,11 @@ const make = Effect.gen(function* () {
     );
   };
 
-  const executeTabOperation = async (tab: ServerTab, request: PreviewAutomationRequest) => {
+  const executeTabOperation = async (
+    tab: ServerTab,
+    request: PreviewAutomationRequest,
+    snapshotDeadline: number,
+  ) => {
     const input = request.input;
     switch (request.operation) {
       case "navigate": {
@@ -2152,11 +2221,24 @@ const make = Effect.gen(function* () {
         return { tabId: tab.tabId, colorScheme };
       }
       case "snapshot": {
-        return withScreencastsPaused(tab, () =>
-          ServerBrowserPage.snapshot({
-            ...tab,
-            renderScale: tab.desktop ? "display" : RENDER_SCALE,
-          }),
+        const deadline = snapshotDeadline;
+        const checkDeadline = () => {
+          if (Date.now() >= deadline) throw snapshotTimeout();
+        };
+        checkDeadline();
+        return withScreencastsPaused(
+          tab,
+          () => {
+            checkDeadline();
+            return ServerBrowserPage.captureSnapshot(
+              {
+                ...tab,
+                renderScale: tab.desktop ? "display" : RENDER_SCALE,
+              },
+              deadline,
+            );
+          },
+          checkDeadline,
         );
       }
       case "click": {
@@ -2209,12 +2291,37 @@ const make = Effect.gen(function* () {
     }
   };
 
+  const snapshotTimeout = () =>
+    new ServerBrowserPage.ServerBrowserOperationError(
+      "PreviewAutomationTimeoutError",
+      "The page was too busy to capture a snapshot in time. Wait for it to settle and take another snapshot.",
+    );
+
+  const runRequest = async (request: PreviewAutomationRequest) => {
+    const snapshotBudget = Math.min(ServerBrowserPage.SNAPSHOT_TIMEOUT_MS, request.timeoutMs);
+    const deadline = Date.now() + snapshotBudget;
+    const work = runOperation(request, performance.now() + request.timeoutMs, deadline).finally(
+      () => markUsed(request),
+    );
+    if (request.operation !== "snapshot") return work;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // Only the response races the deadline. The control queue, capture lock and pause
+      // remain held until the real work drains, even if a CDP session never answers.
+      return await Promise.race([
+        work,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(snapshotTimeout()), snapshotBudget);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
   const handleRequest = (connectionId: string, request: PreviewAutomationRequest) =>
     Effect.tryPromise({
-      try: () =>
-        runOperation(request, performance.now() + request.timeoutMs).finally(() =>
-          markUsed(request),
-        ),
+      try: () => runRequest(request),
       catch: ServerBrowserPage.toOperationError,
     }).pipe(
       Effect.match({

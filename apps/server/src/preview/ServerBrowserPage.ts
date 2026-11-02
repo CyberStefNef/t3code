@@ -204,7 +204,8 @@ const withoutTreeDataPayloads = (tree: string) =>
     .join("\n");
 
 // The broker waits 15s for the host; a snapshot, retry included, answers well before.
-const SNAPSHOT_TIMEOUT_MS = 10_000;
+export const SNAPSHOT_TIMEOUT_MS = 10_000;
+// How long a frame in another process gets to answer; one that crashed never does.
 const FRAME_ANSWER_MS = 1_000;
 
 // Include password and CSS-masked text in open shadow roots, normalized like accessible text.
@@ -448,8 +449,13 @@ const readPageMetrics = async (cdp: CDPSession) => {
 // in any capture it shrinks.
 export const captureViewport = async (
   cdp: CDPSession,
-  options: { readonly format: "png" | "jpeg"; readonly quality?: number },
+  options: {
+    readonly format: "png" | "jpeg";
+    readonly quality?: number;
+    readonly deadline?: number;
+  },
 ) => {
+  if (options.deadline !== undefined && Date.now() >= options.deadline) throw tooBusy();
   const { data } = await cdp.send("Page.captureScreenshot", {
     format: options.format,
     ...(options.quality === undefined ? {} : { quality: options.quality }),
@@ -534,71 +540,104 @@ const capture = async (
   const generation = state.generation;
   const { readers, read } = await openReaders(input.page, input.cdp);
   const before = await read();
-  // Bracket the tree with value reads to detect changes; await tree completion before retrying failed captures.
-  const pageAndScreenshot = Promise.all([
+  if (Date.now() >= deadline) throw tooBusy();
+  // Taken between the reads, so a value that changes during either fails the comparison.
+  // Awaited after the tree: a capture that fails has finished its tree before a retry starts.
+  const pending = [
     input.page.evaluate(SNAPSHOT_SCRIPT) as Promise<
       Pick<
         PreviewAutomationSnapshot,
         "url" | "title" | "loading" | "visibleText" | "interactiveElements"
       >
     >,
-    captureViewport(input.cdp, { format: "png" }).then((png) =>
+    captureViewport(input.cdp, { format: "png", deadline }).then((png) =>
       scale < 1 ? shrinkPng(input.cdp, png, scale) : png,
     ),
-  ]);
+  ] as const;
+  const pageAndScreenshot = Promise.all(pending);
   void pageAndScreenshot.catch(constVoid);
-  // Leaves time for the second read; a frame that never loads holds the tree until then.
-  const tree = await input.page.ariaSnapshot({
-    mode: "ai",
-    boxes: true,
-    timeout: Math.max(1, deadline - Date.now() - 2_000),
-  });
-  const after = await read(before);
-  // A value that changed meanwhile may be in the tree under neither reading.
-  if (after.some((values, i) => values && JSON.stringify(values) !== JSON.stringify(before[i])))
-    throw pageChanged();
-  const dotted = dottedPattern(after.flatMap((values) => values ?? []));
-  // Unread frames can expose values only if their content appears in the tree.
-  const unread = readers.flatMap((reader, i) => (after[i] ? [] : reader.frames));
-  const filled = /^\s*- iframe (?:\[active\] )?\[ref=(\S+?)\].*:$/gm;
-  for (const [, ref] of unread.length ? tree.matchAll(filled) : []) {
-    const iframe = await input.page.locator(`aria-ref=${ref}`).elementHandle({ timeout: 2_000 });
-    if (!iframe) throw pageChanged();
-    const frame = await iframe.contentFrame();
-    void iframe.dispose().catch(constVoid);
-    if (frame && unread.includes(frame)) throw tooBusy();
-  }
-  const [page, data] = await pageAndScreenshot;
-  if (state.generation !== generation) throw pageChanged();
-  const mask = (text: string) => (dotted ? text.replace(dotted, MASKED_VALUE) : text);
-  // Redacted before the cut, so a payload crossing it can't leave its start showing, and before
-  // masking, which could hide the `data:` scheme behind a password value's dots.
-  const redacted = withoutTreeDataPayloads(tree);
-  const accessibilityTree = (dotted ? maskTree(redacted, dotted) : redacted)
-    .slice(0, MAX_VISIBLE_TEXT_LENGTH)
-    .replace(/\[ref=((?:f\d+)?e\d+)\]/g, (_match, nativeRef: string) => {
-      const ref = `t3-${generation}-${nativeRef}`;
-      state.refs.set(ref, nativeRef);
-      return `[ref=${ref}]`;
+  try {
+    // Leaves time for the second read; a frame that never loads holds the tree until then.
+    const tree = await input.page.ariaSnapshot({
+      mode: "ai",
+      boxes: true,
+      timeout: Math.max(1, deadline - Date.now() - 2_000),
     });
-  return {
-    ...page,
-    // Mask text before truncating so a value crossing the cut cannot leak its prefix.
-    visibleText: mask(page.visibleText).slice(0, MAX_VISIBLE_TEXT_LENGTH),
-    accessibilityTree,
-    consoleEntries: [...input.consoleEntries],
-    networkEntries: [...input.networkEntries],
-    actionTimeline: [...input.actionTimeline],
-    screenshot: {
-      mimeType: "image/png",
-      data,
-      ...pngSize(data),
-    },
-  };
+    if (Date.now() >= deadline) throw tooBusy();
+    const after = await read(before);
+    // A value that changed meanwhile may be in the tree under neither reading.
+    if (after.some((values, i) => values && JSON.stringify(values) !== JSON.stringify(before[i])))
+      throw pageChanged();
+    const dotted = dottedPattern(after.flatMap((values) => values ?? []));
+    // A frame that didn't answer both times, such as one that crashed, can only hold values the
+    // tree shows if the tree shows its content.
+    const unread = readers.flatMap((reader, i) => (after[i] ? [] : reader.frames));
+    const filled = /^\s*- iframe (?:\[active\] )?\[ref=(\S+?)\].*:$/gm;
+    for (const [, ref] of unread.length ? tree.matchAll(filled) : []) {
+      const iframe = await input.page.locator(`aria-ref=${ref}`).elementHandle({ timeout: 2_000 });
+      if (!iframe) throw pageChanged();
+      const frame = await iframe.contentFrame();
+      void iframe.dispose().catch(constVoid);
+      if (frame && unread.includes(frame)) throw tooBusy();
+    }
+    const [page, data] = await pageAndScreenshot;
+    if (Date.now() >= deadline) throw tooBusy();
+    if (state.generation !== generation) throw pageChanged();
+    const mask = (text: string) => (dotted ? text.replace(dotted, MASKED_VALUE) : text);
+    // Redacted before the cut, so a payload crossing it can't leave its start showing, and before
+    // masking, which could hide the `data:` scheme behind a password value's dots.
+    const redacted = withoutTreeDataPayloads(tree);
+    const accessibilityTree = (dotted ? maskTree(redacted, dotted) : redacted)
+      .slice(0, MAX_VISIBLE_TEXT_LENGTH)
+      .replace(/\[ref=((?:f\d+)?e\d+)\]/g, (_match, nativeRef: string) => {
+        const ref = `t3-${generation}-${nativeRef}`;
+        state.refs.set(ref, nativeRef);
+        return `[ref=${ref}]`;
+      });
+    return {
+      ...page,
+      url: withoutDataPayload(page.url),
+      // Text that holds a value would otherwise show where the tree masked it. Masked before
+      // the cut, so a value crossing it can't leave its start showing.
+      visibleText: mask(page.visibleText).slice(0, MAX_VISIBLE_TEXT_LENGTH),
+      accessibilityTree,
+      consoleEntries: [...input.consoleEntries],
+      networkEntries: [...input.networkEntries],
+      actionTimeline: [...input.actionTimeline],
+      screenshot: {
+        mimeType: "image/png",
+        data,
+        ...pngSize(data),
+      },
+    };
+  } finally {
+    // A failed tree must not release the caller's lock while a scaled screenshot still runs.
+    await Promise.allSettled(pending);
+  }
 };
 
 /** Snapshots begun per page; observers' snapshots aren't queued, so two can overlap. */
 const snapshotTurns = new WeakMap<Page, number>();
+
+/** The caller owns the response deadline and keeps its capture lock until this work drains. */
+export const captureSnapshot = (
+  input: SnapshotInput,
+  deadline: number,
+): Promise<PreviewAutomationSnapshot> => {
+  if (Date.now() >= deadline) return Promise.reject(tooBusy());
+  const turn = (snapshotTurns.get(input.page) ?? 0) + 1;
+  snapshotTurns.set(input.page, turn);
+  // A page that changed mid-capture, like one rotating ads, has usually settled by a second
+  // try. None starts late or after another snapshot began, since it would revoke the refs of
+  // whichever snapshot came next.
+  return capture(input, deadline).catch((cause: unknown) =>
+    Date.now() < deadline &&
+    snapshotTurns.get(input.page) === turn &&
+    !(cause instanceof Error && cause.message === VALUE_TOO_LONG)
+      ? capture(input, deadline)
+      : Promise.reject(cause),
+  );
+};
 
 export const snapshot = async (input: SnapshotInput): Promise<PreviewAutomationSnapshot> => {
   const deadline = Date.now() + SNAPSHOT_TIMEOUT_MS;
@@ -606,16 +645,7 @@ export const snapshot = async (input: SnapshotInput): Promise<PreviewAutomationS
   const expired = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(tooBusy()), SNAPSHOT_TIMEOUT_MS);
   });
-  const turn = (snapshotTurns.get(input.page) ?? 0) + 1;
-  snapshotTurns.set(input.page, turn);
-  // Retry only before the deadline and the next snapshot, whose refs a later retry would revoke.
-  const captured = capture(input, deadline).catch((cause: unknown) =>
-    Date.now() < deadline &&
-    snapshotTurns.get(input.page) === turn &&
-    !(cause instanceof Error && cause.message === VALUE_TOO_LONG)
-      ? capture(input, deadline)
-      : Promise.reject(cause),
-  );
+  const captured = captureSnapshot(input, deadline);
   try {
     return await Promise.race([captured, expired]);
   } catch (cause) {

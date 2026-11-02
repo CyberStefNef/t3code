@@ -2,6 +2,7 @@
 /** The manager owns the single debugger attachment; the relay shares it. */
 import {
   DesktopBrowserCommand,
+  type DesktopBrowserRenderActivity,
   DesktopBrowserEvent,
   type DesktopBrowserEvent as DesktopBrowserEventType,
 } from "@t3tools/contracts";
@@ -16,6 +17,7 @@ import * as Stream from "effect/Stream";
 
 import { createCdpRelayConnection, type CdpRelayConnection } from "./CdpRelay.ts";
 import { sendPageCommand } from "./GuestInput.ts";
+import { withGuestCaptureFrame } from "./GuestCapture.ts";
 
 const encodeEvent = Schema.encodeSync(Schema.fromJsonString(DesktopBrowserEvent));
 const decodeCommand = Schema.decodeUnknownOption(Schema.fromJsonString(DesktopBrowserCommand));
@@ -89,6 +91,8 @@ export class DesktopBrowserHost extends Context.Service<
     readonly detach: (key: DesktopBrowserTabKey) => void;
     readonly humanStartedDownload: (source: Electron.WebContents) => boolean;
     readonly placeDownload: (source: Electron.WebContents, item: Electron.DownloadItem) => boolean;
+    readonly renderActivity: Stream.Stream<DesktopBrowserRenderActivity>;
+    readonly acknowledgeRendering: (leaseId: string, senderId: number) => Effect.Effect<void>;
     readonly pointers: Stream.Stream<{
       readonly key: DesktopBrowserTabKey;
       readonly phase: "move" | "click";
@@ -105,6 +109,8 @@ export class DesktopBrowserHost extends Context.Service<
 
 export const make = Effect.gen(function* () {
   const outbox = yield* PubSub.unbounded<DesktopBrowserEventType>();
+  const renderActivity = yield* PubSub.unbounded<DesktopBrowserRenderActivity>();
+  const leases = new Map<string, AttachedTab>();
   const pointers = yield* PubSub.sliding<{
     readonly key: DesktopBrowserTabKey;
     readonly phase: "move" | "click";
@@ -302,9 +308,7 @@ export const make = Effect.gen(function* () {
     if (tab.relay) return tab.relay;
     const { webContents, debugger: debuggee } = tab.debuggee;
     const send = (method: string, params: Record<string, unknown>, sessionId?: string) =>
-      sessionId === undefined
-        ? sendPageCommand(webContents, debuggee, method, params)
-        : debuggee.sendCommand(method, params, sessionId);
+      sendPageCommand(webContents, debuggee, method, params, sessionId);
     const detachedOwners = new Set<string>();
     /** Viewers and recordings stream; the agent's own sessions never do. */
     const streamingOwners = new Set<string>();
@@ -328,10 +332,14 @@ export const make = Effect.gen(function* () {
           // Waits for focus emulation; insertText and other non-CDP input would not queue behind it.
           const forward = (current?: () => boolean) => {
             const change = tab.focusChange;
-            const run = () =>
+            const sendCurrent = () =>
               tab.relay === relay && (current === undefined || current())
                 ? send(method, params, sessionId)
                 : Promise.reject(new Error("The page this screenshot was for has moved on."));
+            const run = () =>
+              method === "Page.captureScreenshot"
+                ? withGuestCaptureFrame(webContents, sendCurrent)
+                : sendCurrent();
             return change === null ? run() : change.then(run);
           };
           return method === "Page.captureScreenshot"
@@ -406,12 +414,27 @@ export const make = Effect.gen(function* () {
     return true;
   };
 
+  const releaseRendering = (tab: AttachedTab) => {
+    for (const [leaseId, owner] of leases) {
+      if (owner !== tab) continue;
+      leases.delete(leaseId);
+      runFork(
+        PubSub.publish(renderActivity, {
+          leaseId,
+          webContentsId: tab.debuggee.webContents.id,
+          active: false,
+        }),
+      );
+    }
+  };
+
   const detach = (key: DesktopBrowserTabKey) => {
     const id = keyOf(key);
     const tab = tabs.get(id);
     if (!tab) return;
     tabs.delete(id);
     tab.relay = null;
+    releaseRendering(tab);
     tab.debuggee.debugger.off("message", tab.onMessage);
     tab.debuggee.webContents.off("did-navigate", tab.onNewDocument);
     syncPainting(tab);
@@ -440,7 +463,7 @@ export const make = Effect.gen(function* () {
       focusReleasing: false,
       screencasts: new Set(),
       onMessage: (_event, method, params, sessionId) => {
-        if (method === "Browser.downloadWillBegin") {
+        if (method === "Page.downloadWillBegin") {
           const guid = (params as { guid?: unknown } | undefined)?.guid;
           tab.pendingDownloadGuid = typeof guid === "string" ? guid : null;
         }
@@ -471,6 +494,21 @@ export const make = Effect.gen(function* () {
       }
       const tab = tabs.get(keyOf(command.value));
       if (!tab) return;
+      if (command.value.type === "rendering") {
+        const { leaseId, active } = command.value;
+        const owner = leases.get(leaseId);
+        if (owner && owner !== tab) return;
+        if (active) leases.set(leaseId, tab);
+        else leases.delete(leaseId);
+        runFork(
+          PubSub.publish(renderActivity, {
+            leaseId,
+            active,
+            webContentsId: tab.debuggee.webContents.id,
+          }),
+        );
+        return;
+      }
       if (command.value.type === "pointer") {
         const { threadId, tabId, phase, x, y } = command.value;
         runFork(PubSub.publish(pointers, { key: { threadId, tabId }, phase, x, y }));
@@ -478,6 +516,7 @@ export const make = Effect.gen(function* () {
       }
       if (command.value.type === "release") {
         dropRelay(tab);
+        releaseRendering(tab);
         return;
       }
       if (AGENT_INPUT_COMMAND.test(command.value.message)) tab.agentInputAt = performance.now();
@@ -503,6 +542,16 @@ export const make = Effect.gen(function* () {
   });
 
   return DesktopBrowserHost.of({
+    renderActivity: Stream.fromPubSub(renderActivity),
+    acknowledgeRendering: Effect.fn("DesktopBrowserHost.acknowledgeRendering")(
+      function (leaseId, senderId) {
+        return Effect.sync(() => {
+          const tab = leases.get(leaseId);
+          if (!tab || tab.debuggee.webContents.hostWebContents?.id !== senderId) return;
+          emit({ type: "rendering-ready", ...tab.key, leaseId });
+        });
+      },
+    ),
     pointers: Stream.fromPubSub(pointers),
     painting: Stream.fromPubSub(painting),
     // Subscribes before announcing, so no attach falls between the two.

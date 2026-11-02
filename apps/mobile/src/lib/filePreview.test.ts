@@ -1,3 +1,5 @@
+import { EnvironmentAuthorizationError } from "@t3tools/contracts";
+import { MISSING_FILE_ACCESS_MESSAGE } from "@t3tools/client-runtime/state/assets";
 import {
   act,
   createElement,
@@ -10,7 +12,7 @@ import {
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { inlineFilePreviewKind, isPdfFile } from "./filePreview";
+import { filePreviewErrorMessage, inlineFilePreviewKind, isPdfFile } from "./filePreview";
 import { ThreadInlineFilePreview } from "../features/threads/ThreadInlineFilePreview";
 import { AudioFilePreview } from "../features/files/AudioFilePreview";
 import { MediaVideoPlayer } from "../components/MediaVideoPlayer";
@@ -214,6 +216,7 @@ vi.mock("react-native-reanimated", () => {
   return {
     default: { View: ({ children }: { children?: ReactNode }) => children },
     FadeIn: transition,
+    FadeInDown: transition,
     FadeInUp: transition,
   };
 });
@@ -268,7 +271,7 @@ vi.mock("./openExternalUrl", () => ({}));
 vi.mock("./attachmentDownload", () => ({}));
 vi.mock("./uuid", () => ({}));
 vi.mock("../features/threads/thread-context-divider", () => ({}));
-vi.mock("../features/threads/thread-handoff-row", () => ({}));
+vi.mock("../features/threads/thread-handoff-row", () => ({ ThreadModelSwitchDivider: () => null }));
 vi.mock("../features/threads/ThreadGuestShareBar", () => ({ useThreadGuestShare: () => null }));
 vi.mock("../features/threads/SecretRequestCard", () => ({}));
 vi.mock("../features/threads/LinkRequestCard", () => ({ LinkRequestCard: () => null }));
@@ -1417,5 +1420,36 @@ describe("ThreadFeed previews", () => {
     } finally {
       await act(async () => root.unmount());
     }
+  });
+});
+
+describe("file preview failures", () => {
+  const fallback = "Reconnect to this environment and try again.";
+
+  it.each([
+    { requiredScope: "filesystem:read" as const },
+    { requiredScope: "orchestration:read" as const, requiredPermission: "filesystem:read" },
+  ])("explains how to restore file access for %j", (required) => {
+    const error = new EnvironmentAuthorizationError({
+      message: "The authenticated token is missing required scope: filesystem:read.",
+      ...required,
+    });
+
+    expect(filePreviewErrorMessage(error, fallback)).toBe(MISSING_FILE_ACCESS_MESSAGE);
+  });
+
+  it.each([
+    new Error("The file was deleted."),
+    new EnvironmentAuthorizationError({
+      message: "This connection cannot read attachments.",
+      requiredScope: "orchestration:read",
+    }),
+    new EnvironmentAuthorizationError({
+      message: "This connection cannot write files.",
+      requiredScope: "filesystem:read",
+      requiredPermission: "filesystem:write",
+    }),
+  ])("keeps the fallback for other failures: %s", (error) => {
+    expect(filePreviewErrorMessage(error, fallback)).toBe(fallback);
   });
 });

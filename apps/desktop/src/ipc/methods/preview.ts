@@ -26,6 +26,8 @@ import {
   MAX_KEYBINDINGS_COUNT,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
+import * as DesktopBrowserHost from "../../preview/DesktopBrowserHost.ts";
 import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
 import * as NodeURL from "node:url";
@@ -43,6 +45,13 @@ export const installPreviewEventForwarding = Effect.fn(
   "desktop.ipc.preview.installEventForwarding",
 )(function* () {
   const electronWindow = yield* ElectronWindow.ElectronWindow;
+  const host = yield* DesktopBrowserHost.DesktopBrowserHost;
+  yield* host.renderActivity.pipe(
+    Stream.runForEach((event) =>
+      electronWindow.sendAll(IpcChannels.PREVIEW_RENDER_ACTIVITY_CHANNEL, event),
+    ),
+    Effect.forkScoped,
+  );
   const manager = yield* PreviewManager.PreviewManager;
   yield* manager.subscribeStateChanges((tabId, state) =>
     electronWindow.sendAll(IpcChannels.PREVIEW_STATE_CHANGE_CHANNEL, tabId, state),
@@ -416,7 +425,19 @@ const saveRecording = DesktopIpc.makeIpcMethod({
   }),
 });
 
+const acknowledgeRendering = DesktopIpc.makeIpcMethod({
+  channel: IpcChannels.PREVIEW_RENDER_READY_CHANNEL,
+  payload: Schema.String,
+  result: Schema.Void,
+  handler: Effect.fn("desktop.ipc.preview.acknowledgeRendering")(function* (leaseId, event) {
+    if (!event) return;
+    const host = yield* DesktopBrowserHost.DesktopBrowserHost;
+    yield* host.acknowledgeRendering(leaseId, event.sender.id);
+  }),
+});
+
 export const methods = [
+  acknowledgeRendering,
   setForwardedShortcuts,
   createTab,
   closeTab,

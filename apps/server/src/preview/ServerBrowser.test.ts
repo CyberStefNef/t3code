@@ -58,7 +58,7 @@ vi.mock("./ServerBrowserContexts.ts", () => ({
       return makeEncoderPage() as unknown as Page;
     }
     async connectDesktopPage(endpoint: string) {
-      const context = makeContext();
+      const context = makeContext(undefined, desktopPageUrl);
       context.page.viewportSize.mockReturnValue(null);
       desktopConnections.push({ endpoint, context });
       return { browser: { close: async () => {} }, page: context.page as unknown as Page };
@@ -151,12 +151,12 @@ function fileChooserElement(accept: string) {
   };
 }
 
-function makeContext(onClose?: (context: BrowserContext) => void) {
+function makeContext(onClose?: (context: BrowserContext) => void, initialUrl = "about:blank") {
   const events = new NodeEvents.EventEmitter();
   const nativeFileChooser = vi.fn();
   const setChooserFiles = vi.fn(async (_files: unknown) => {});
   const sessions: ReturnType<typeof makeSession>[] = [];
-  let url = "about:blank";
+  let url = initialUrl;
   let viewport: ReturnType<Page["viewportSize"]> = { width: 1280, height: 800 };
   const cssViewport = { width: 1920, height: 1080 };
   let closed = false;
@@ -299,8 +299,10 @@ let focusedFrame: ReturnType<typeof makeFrame> | null = null;
 let contextFailure: Error | null = null;
 let initialNavigation: (() => Promise<void>) | null = null;
 let desktopRendersNext = false;
+let desktopPageUrl = "about:blank";
 /** Replaces the answer to the desktop page's size reads. */
 let desktopSizeAnswer: (() => Promise<Record<string, unknown>>) | null = null;
+const renderLease = vi.fn(() => ({ ready: Promise.resolve(), release: vi.fn() }));
 const desktopDetaches = new NodeEvents.EventEmitter();
 let desktopDetachReady = Promise.withResolvers<void>();
 let desktopReleased = Promise.withResolvers<void>();
@@ -377,6 +379,14 @@ const dependencies = Layer.mergeAll(
           desktopReleased.resolve();
         }),
       ),
+    rendering: () =>
+      Effect.gen(function* () {
+        const lease = yield* Effect.acquireRelease(
+          Effect.sync(() => renderLease()),
+          (lease) => Effect.sync(() => lease.release()),
+        );
+        yield* Effect.promise(() => lease.ready);
+      }),
     pointer: () => Effect.void,
     turn: (threadId, active) => Effect.sync(() => desktopTurns.emit("turn", threadId, active)),
   }),
@@ -446,9 +456,11 @@ beforeEach(() => {
   focusedFrame = null;
   desktopTabs.clear();
   desktopRendersNext = false;
+  desktopPageUrl = "about:blank";
   desktopSizeAnswer = null;
   desktopDetachReady = Promise.withResolvers<void>();
   desktopReleased = Promise.withResolvers<void>();
+  renderLease.mockClear();
   releasedDesktopTabs.length = 0;
   desktopConnections.length = 0;
 });
@@ -559,6 +571,33 @@ it.effect("a tab the desktop does not draw is marked headless, so the desktop st
 
       expect(headlessOf(tabId)).toBe(true);
       expect(headlessOf(desktopTab.tabId)).toBeUndefined();
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.effect("a desktop page that loaded before the server attached reports its loaded title", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { broker } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      const events = yield* manager.subscribeEvents;
+      desktopRendersNext = true;
+      desktopPageUrl = "https://example.com/loaded";
+      const opened = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        operation: "open",
+        input: { url: desktopPageUrl, reuseExistingTab: false, show: false },
+      });
+      let event = yield* PubSub.take(events);
+      while (event.type !== "navigated" || event.tabId !== opened.tabId) {
+        event = yield* PubSub.take(events);
+      }
+
+      expect(event.snapshot.navStatus).toEqual({
+        _tag: "Success",
+        url: "https://example.com/loaded",
+        title: "test page",
+      });
     }),
   ).pipe(Effect.provide(layer)),
 );
@@ -989,6 +1028,49 @@ it.live(
     ).pipe(Effect.provide(layer)),
 );
 
+it.effect("a navigation that fails while a load reads its title keeps its failure", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      const events = yield* manager.subscribeEvents;
+      const page = contexts[0]!.page;
+      const heldTitle = Promise.withResolvers<string>();
+      page.title.mockImplementationOnce(() => heldTitle.promise);
+      yield* Effect.promise(() => page.goto("https://example.com/first"));
+      const failing = {
+        url: () => "https://example.com/missing",
+        method: () => "GET",
+        isNavigationRequest: () => true,
+        frame: () => page,
+        failure: () => ({ errorText: "net::ERR_NAME_NOT_RESOLVED" }),
+      };
+      page.emit("request", failing);
+      page.emit("requestfailed", failing);
+      heldTitle.resolve("Held");
+      // A load at the same await depth reports after the held one, so its Success marks the end.
+      page.emit("load");
+
+      const statuses: Array<string> = [];
+      while (!statuses.at(-1)?.startsWith("Success")) {
+        const event = yield* PubSub.take(events);
+        if (event.type === "failed" && event.tabId === tabId) {
+          statuses.push(`LoadFailed ${event.url}`);
+        } else if (event.type === "navigated" && event.tabId === tabId) {
+          const status = event.snapshot.navStatus;
+          if (status._tag === "Success") statuses.push(`Success ${status.title}`);
+          else if (status._tag === "Loading") statuses.push(`Loading ${status.url}`);
+        }
+      }
+      expect(statuses).toEqual([
+        "Loading https://example.com/missing",
+        "LoadFailed https://example.com/missing",
+        "Success test page",
+      ]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
 it.effect.each([
   {
     name: "hover burst before a click",
@@ -1234,6 +1316,45 @@ it.live.each([false, true])(
         }
       }),
     ).pipe(Effect.provide(layer)),
+);
+
+it.effect("a tab showing a data: page reports its URL without the content", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { broker, tabId } = yield* ready;
+      const sibling = yield* broker.invoke<PreviewAutomationStatus>({
+        scope: asSession("agent-b"),
+        operation: "open",
+        input: { reuseExistingTab: false, show: false },
+      });
+      yield* Effect.promise(() => contexts[1]!.page.goto("data:text/html,<p>SIBLING-SECRET</p>"));
+      const manager = yield* Manager.PreviewManager;
+      const events = yield* manager.subscribeEvents;
+      yield* Effect.promise(() => contexts[0]!.page.goto("data:text/html,<p>SECRET-KEY</p>"));
+      let event = yield* PubSub.take(events);
+      while (
+        event.type !== "navigated" ||
+        event.tabId !== tabId ||
+        event.snapshot.navStatus._tag !== "Success"
+      ) {
+        event = yield* PubSub.take(events);
+      }
+      const status = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        tabId,
+        operation: "status",
+        input: {},
+      });
+      expect(event.snapshot.navStatus).toMatchObject({ url: "data:text/html,…" });
+      expect(status.url).toBe("data:text/html,…");
+      expect(status.tabs?.find((entry) => entry.tabId === tabId)?.url).toBe("data:text/html,…");
+      expect(status.tabs?.find((entry) => entry.tabId === sibling.tabId)?.url).toBe(
+        "data:text/html,…",
+      );
+      expect(JSON.stringify([event, status])).not.toContain("SECRET-KEY");
+      expect(JSON.stringify([event, status])).not.toContain("SIBLING-SECRET");
+    }),
+  ).pipe(Effect.provide(layer)),
 );
 
 it.live.each(["save failed", "oversized"])(
@@ -2112,4 +2233,218 @@ it.live("failed session and browser launches release capacity, as does closing a
       expect(status.tabs).toHaveLength(8);
     }),
   ).pipe(Effect.provide(layer)),
+);
+
+it.live.each(
+  [
+    { stage: "pause", access: "observer" },
+    { stage: "capture", access: "observer" },
+    { stage: "resume", access: "observer" },
+    { stage: "pause", access: "owner" },
+    { stage: "capture", access: "owner" },
+    { stage: "resume", access: "owner" },
+    { stage: "failedTree", access: "observer" },
+  ].flatMap((scenario) => [
+    { ...scenario, desktop: false },
+    { ...scenario, desktop: true },
+  ]),
+)(
+  "snapshot deadline covers blocked $stage for $access (desktop=$desktop) without releasing active work",
+  ({ stage, access, desktop }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        desktopRendersNext = desktop;
+        const { browser, broker, tabId } = yield* ready;
+        yield* browser.attachViewer(viewerInput(tabId, false));
+        renderLease.mockClear();
+        const context = desktop ? desktopConnections.at(-1)!.context : contexts[0]!;
+        const viewerSession = context.sessions.at(-1)!;
+        const target =
+          stage === "capture" || stage === "failedTree" ? context.sessions[0]! : viewerSession;
+        if (stage === "failedTree")
+          context.page.ariaSnapshot.mockRejectedValueOnce(
+            new Error("Tree failed while screenshot was pending"),
+          );
+        const method =
+          stage === "pause"
+            ? "Page.stopScreencast"
+            : stage === "resume"
+              ? "Page.startScreencast"
+              : "Page.captureScreenshot";
+        const entered = Promise.withResolvers<void>();
+        const blocked = Promise.withResolvers<void>();
+        const original = target.send.getMockImplementation()!;
+        let blockNext = true;
+        target.send.mockImplementation(async (name, input) => {
+          if (name === method && blockNext) {
+            blockNext = false;
+            entered.resolve();
+            await blocked.promise;
+          }
+          return original(name, input);
+        });
+        vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+        try {
+          const results: unknown[] = [];
+          const snapshot = (onTargetTab?: () => void) =>
+            broker
+              .invoke<PreviewAutomationSnapshot>({
+                scope: access === "owner" ? scope : asSession("observer"),
+                tabId,
+                operation: "snapshot",
+                input: {},
+                ...(onTargetTab ? { onTargetTab } : {}),
+              })
+              .pipe(
+                Effect.match({
+                  onSuccess: (result) => results.push(result),
+                  onFailure: (error) => results.push(error),
+                }),
+              );
+          const first = yield* snapshot().pipe(Effect.forkChild);
+          yield* Effect.promise(() => entered.promise);
+          const submitted = Promise.withResolvers<void>();
+          const queued = yield* snapshot(submitted.resolve).pipe(Effect.forkChild);
+          yield* Effect.promise(() => submitted.promise);
+          yield* Effect.yieldNow;
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(10_000));
+          const activeLease = renderLease.mock.results[0]?.value;
+          if (desktop) {
+            expect(renderLease).toHaveBeenCalledTimes(1);
+            expect(activeLease.release).not.toHaveBeenCalled();
+          } else expect(renderLease).not.toHaveBeenCalled();
+          const beforeDrain = [...results];
+          const capturesBeforeDrain = context.page.ariaSnapshot.mock.calls.length;
+          const resumesBeforeDrain = viewerSession.send.mock.calls.filter(
+            ([name]) => name === "Page.startScreencast",
+          ).length;
+          blocked.resolve();
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(0));
+          yield* Fiber.join(first);
+          yield* Fiber.join(queued);
+          if (desktop) expect(activeLease.release).toHaveBeenCalledTimes(1);
+          expect(beforeDrain).toHaveLength(2);
+          expect(beforeDrain).toEqual([
+            expect.objectContaining({
+              _tag: "PreviewAutomationTimeoutError",
+              cause: expect.objectContaining({ message: expect.stringContaining("too busy") }),
+            }),
+            expect.objectContaining({
+              _tag: "PreviewAutomationTimeoutError",
+              cause: expect.objectContaining({ message: expect.stringContaining("too busy") }),
+            }),
+          ]);
+          expect(capturesBeforeDrain).toBe(stage === "pause" ? 0 : 1);
+          expect(context.page.ariaSnapshot).toHaveBeenCalledTimes(stage === "pause" ? 0 : 1);
+          if (stage !== "resume") expect(resumesBeforeDrain).toBe(1);
+          yield* broker.invoke<PreviewAutomationSnapshot>({
+            scope: access === "owner" ? scope : asSession("observer"),
+            tabId,
+            operation: "snapshot",
+            input: {},
+          });
+          expect(context.page.ariaSnapshot).toHaveBeenCalledTimes(stage === "pause" ? 1 : 2);
+        } finally {
+          blocked.resolve();
+          vi.useRealTimers();
+        }
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
+it.live("does not start a desktop snapshot before its render layout acknowledgement", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      desktopRendersNext = true;
+      const { broker, tabId } = yield* ready;
+      const entered = Promise.withResolvers<void>();
+      const acknowledged = Promise.withResolvers<void>();
+      const release = vi.fn();
+      renderLease.mockImplementationOnce(() => {
+        entered.resolve();
+        return { ready: acknowledged.promise, release };
+      });
+      const pending = yield* broker
+        .invoke<PreviewAutomationSnapshot>({
+          scope,
+          tabId,
+          operation: "snapshot",
+          input: {},
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => entered.promise);
+      const context = desktopConnections.at(-1)!.context;
+      expect(context.page.ariaSnapshot).not.toHaveBeenCalled();
+      expect(
+        context.sessions[0]!.send.mock.calls.filter(
+          ([method]) => method === "Page.captureScreenshot",
+        ),
+      ).toEqual([]);
+      expect(release).not.toHaveBeenCalled();
+      acknowledged.resolve();
+      yield* Fiber.join(pending);
+      expect(context.page.ariaSnapshot).toHaveBeenCalledOnce();
+      expect(release).toHaveBeenCalledOnce();
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("retains desktop rendering for a server recording and releases it on tab close", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      desktopRendersNext = true;
+      const { broker, tabId } = yield* ready;
+      const released = Promise.withResolvers<void>();
+      const transient = { ready: Promise.resolve(), release: vi.fn() };
+      const recording = { ready: Promise.resolve(), release: vi.fn(() => released.resolve()) };
+      renderLease.mockImplementationOnce(() => transient).mockImplementationOnce(() => recording);
+      yield* broker.invoke({ scope, tabId, operation: "recordingStart", input: {} });
+      expect(transient.release).toHaveBeenCalledOnce();
+      expect(recording.release).not.toHaveBeenCalled();
+      yield* broker.invoke({ scope, tabId, operation: "close", input: {} });
+      yield* Effect.promise(() => released.promise);
+      expect(recording.release).toHaveBeenCalledOnce();
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live.each([false, true])(
+  "holds desktop rendering throughout a first click (failure=%s)",
+  (fails) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        desktopRendersNext = true;
+        const { broker, tabId } = yield* ready;
+        const context = desktopConnections.at(-1)!.context;
+        let rendering = false;
+        const release = vi.fn(() => {
+          rendering = false;
+        });
+        renderLease.mockImplementationOnce(() => {
+          rendering = true;
+          return { ready: Promise.resolve(), release };
+        });
+        const scroll = vi.fn(async () => {
+          expect(rendering).toBe(true);
+        });
+        const clicked = vi.fn(async () => {
+          expect(rendering).toBe(true);
+          expect(release).not.toHaveBeenCalled();
+          if (fails) throw new Error("click rejected");
+        });
+        context.page.locator.mockReturnValue({
+          scrollIntoViewIfNeeded: scroll,
+          boundingBox: async () => ({ x: 0, y: 0, width: 10, height: 10 }),
+          click: clicked,
+        } as never);
+        const result = yield* broker
+          .invoke({ scope, tabId, operation: "click", input: { locator: "text=Own target" } })
+          .pipe(Effect.result);
+        expect(scroll).toHaveBeenCalledOnce();
+        expect(clicked).toHaveBeenCalledOnce();
+        expect(result._tag).toBe(fails ? "Failure" : "Success");
+        expect(release).toHaveBeenCalledOnce();
+        expect(rendering).toBe(false);
+      }),
+    ).pipe(Effect.provide(layer)),
 );

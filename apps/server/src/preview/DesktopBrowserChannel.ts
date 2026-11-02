@@ -8,6 +8,7 @@ import {
   type DesktopBrowserCommand as DesktopBrowserCommandType,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -35,6 +36,77 @@ export interface DesktopTabKey {
 
 const keyOf = ({ threadId, tabId }: DesktopTabKey) => `${threadId}\u0000${tabId}`;
 
+export class DesktopBrowserRenderingError extends Schema.TaggedError<DesktopBrowserRenderingError>()(
+  "DesktopBrowserRenderingError",
+  { message: Schema.String },
+) {}
+
+/** A scope owns the lease, including failed acquisition and late capture drain. */
+export const makeRenderingActivity = Effect.fn("DesktopBrowserChannel.makeRenderingActivity")(
+  (
+    command: (message: DesktopBrowserCommandType) => Effect.Effect<void>,
+    isAttached: (key: DesktopTabKey) => boolean,
+  ) =>
+    Effect.sync(() => {
+      const leases = new Map<
+        string,
+        { key: DesktopTabKey; ready: Deferred.Deferred<void, DesktopBrowserRenderingError> }
+      >();
+      return {
+        acknowledge: (key: DesktopTabKey, leaseId: string) => {
+          const lease = leases.get(leaseId);
+          return lease && keyOf(lease.key) === keyOf(key)
+            ? Deferred.succeed(lease.ready, undefined).pipe(Effect.asVoid)
+            : Effect.void;
+        },
+        detach: (key?: DesktopTabKey) =>
+          Effect.suspend(() =>
+            Effect.forEach(
+              [...leases.values()].filter((lease) => !key || keyOf(lease.key) === keyOf(key)),
+              (lease) =>
+                Deferred.fail(
+                  lease.ready,
+                  new DesktopBrowserRenderingError({
+                    message: "The desktop tab detached during capture.",
+                  }),
+                ),
+              { discard: true },
+            ),
+          ),
+        acquire: Effect.fn("DesktopBrowserChannel.acquireRendering")(function* (
+          key: DesktopTabKey,
+        ) {
+          const leaseId = NodeCrypto.randomUUID();
+          const ready = yield* Deferred.make<void, DesktopBrowserRenderingError>();
+          yield* Effect.acquireRelease(
+            Effect.sync(() => leases.set(leaseId, { key, ready })),
+            () =>
+              Effect.gen(function* () {
+                leases.delete(leaseId);
+                yield* command({ type: "rendering", ...key, leaseId, active: false });
+              }),
+          );
+          if (!isAttached(key))
+            return yield* new DesktopBrowserRenderingError({
+              message: "The desktop tab detached before capture.",
+            });
+          yield* command({ type: "rendering", ...key, leaseId, active: true });
+          yield* Deferred.await(ready).pipe(
+            Effect.timeoutOrElse({
+              duration: "3 seconds",
+              orElse: () =>
+                Effect.fail(
+                  new DesktopBrowserRenderingError({
+                    message: "The desktop preview did not acknowledge its capture layout.",
+                  }),
+                ),
+            }),
+          );
+        }),
+      };
+    }),
+);
+
 export class DesktopBrowserChannel extends Context.Service<
   DesktopBrowserChannel,
   {
@@ -45,6 +117,9 @@ export class DesktopBrowserChannel extends Context.Service<
     readonly attached: Stream.Stream<DesktopTabKey>;
     readonly isAttached: (key: DesktopTabKey) => Effect.Effect<boolean>;
     readonly endpoint: (key: DesktopTabKey) => Effect.Effect<string, never, Scope.Scope>;
+    readonly rendering: (
+      key: DesktopTabKey,
+    ) => Effect.Effect<void, DesktopBrowserRenderingError, Scope.Scope>;
     readonly pointer: (
       key: DesktopTabKey,
       pointer: { readonly phase: "move" | "click"; readonly x: number; readonly y: number },
@@ -83,6 +158,9 @@ const make = Effect.gen(function* () {
       pointer: Effect.fn("DesktopBrowserChannel.pointer")(function () {
         return Effect.void;
       }),
+      rendering: Effect.fn("DesktopBrowserChannel.rendering")(function () {
+        return Effect.void;
+      }),
     });
   }
 
@@ -95,6 +173,8 @@ const make = Effect.gen(function* () {
         ),
       ),
     );
+
+  const rendering = yield* makeRenderingActivity(command, (key) => attachedTabs.has(keyOf(key)));
 
   // Use cancellable socket reads; filesystem pipe reads keep Node alive after scope shutdown.
   const readable = yield* Effect.acquireRelease(
@@ -114,6 +194,9 @@ const make = Effect.gen(function* () {
       const key = { threadId: event.threadId, tabId: event.tabId };
       const id = keyOf(key);
       switch (event.type) {
+        case "rendering-ready": {
+          return rendering.acknowledge(key, event.leaseId);
+        }
         case "cdp": {
           const queue = inbound.get(id);
           return queue ? Queue.offer(queue, event.message).pipe(Effect.asVoid) : Effect.void;
@@ -125,11 +208,13 @@ const make = Effect.gen(function* () {
           attachedTabs.delete(id);
           const queue = inbound.get(id);
           return (queue ? Queue.shutdown(queue) : Effect.void).pipe(
+            Effect.andThen(rendering.detach(key)),
             Effect.andThen(PubSub.publish(changes, { key, attached: false })),
           );
         }
       }
     }),
+    Effect.ensuring(rendering.detach()),
     Effect.catchCause((cause) => Effect.logWarning("desktop browser channel stopped", { cause })),
     Effect.forkScoped,
   );
@@ -228,6 +313,7 @@ const make = Effect.gen(function* () {
     pointer: Effect.fn("DesktopBrowserChannel.pointer")(function (key, pointer) {
       return command({ type: "pointer", ...key, ...pointer });
     }),
+    rendering: rendering.acquire,
   });
 });
 

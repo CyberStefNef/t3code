@@ -82,7 +82,7 @@ function layer(input: {
           Effect.succeed({
             status: "pushed" as const,
             branch: "feature/remote-v1",
-                  setUpstream: true,
+            setUpstream: true,
           }),
         ...input.git,
       }),
@@ -412,6 +412,25 @@ it.effect("reports both failures when the HTTPS retry fails too", () =>
 );
 
 it.effect.each([
+  "git@ssh.dev.azure.com:v3/Fabrikam/Project1/fab_repo",
+  "ssh://user:pa@rt@ssh.dev.azure.com/v3/Fabrikam/Project1/fab_repo",
+  "ssh://us%40er:pa%40ss@ssh.dev.azure.com/v3/Fabrikam/Project1/fab_repo",
+])("retries Azure SSH URL %s using its HTTPS host and repository path", (remoteUrl) =>
+  Effect.gen(function* () {
+    const urls: Array<string> = [];
+    const result = yield* cloneInTemporaryDirectory(rejectingSsh(urls, false), {
+      remoteUrl,
+    });
+
+    assert.deepStrictEqual(urls, [
+      remoteUrl,
+      "https://dev.azure.com/Fabrikam/Project1/_git/fab_repo",
+    ]);
+    assert.strictEqual(result.remoteUrl, "https://dev.azure.com/Fabrikam/Project1/_git/fab_repo");
+  }),
+);
+
+it.effect.each([
   ["the caller asked for SSH", "ssh", "authentication_failed"],
   ["git failed for another reason", undefined, "remote_unreachable"],
 ] as const)("does not retry over HTTPS when %s", ([, protocol, reason]) =>
@@ -677,7 +696,7 @@ it.effect("pins the GitHub account before creating and publishing the repository
               return {
                 status: "pushed" as const,
                 branch: "feature/remote-v1",
-                          setUpstream: true,
+                setUpstream: true,
               };
             }),
         },

@@ -179,6 +179,7 @@ describe("ProjectCloneTracker", () => {
           ...startInput,
           provider: SourceControlProviderKind.make("github"),
           githubAccount: "work-user",
+          protocol: "ssh",
         },
         harness.hooks,
       );
@@ -197,12 +198,14 @@ describe("ProjectCloneTracker", () => {
           destinationPath: startInput.destinationPath,
           provider: "github",
           githubAccount: "work-user",
+          protocol: "ssh",
         },
         {
           remoteUrl: startInput.remoteUrl,
           destinationPath: startInput.destinationPath,
           provider: "github",
           githubAccount: "work-user",
+          protocol: "ssh",
         },
       ]);
     }).pipe(Effect.provide(harness.layer));

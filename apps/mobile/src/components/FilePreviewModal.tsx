@@ -1,3 +1,4 @@
+import { filePreviewErrorMessage } from "../lib/filePreview";
 import * as Dialog from "./ui/Dialog";
 import { useContext, useEffect, useEffectEvent, useState } from "react";
 
@@ -53,7 +54,9 @@ async function resolvePreviewItem(
   }
   if (!("environmentId" in item)) return { source: { ...item, name } };
   // Refresh expired URLs before handing them to Quick Look or ACTION_VIEW, which retain them.
-  const url = await refreshAssetUrl(item.environmentId, item.resource, signal)
+  const url = await refreshAssetUrl(item.environmentId, item.resource, signal, {
+    throwOnError: true,
+  })
     .then((value) => {
       if (!value) throw new Error("Reconnect to this environment and try again.");
       return value;
@@ -82,7 +85,11 @@ function ResolvedFilePreview(props: {
   );
   const onResolutionError = useEffectEvent((error: PreviewResolutionError) => {
     if (props.onOpenError) props.onOpenError(error.cause);
-    else Dialog.alert("Could not open preview", error.fallbackMessage);
+    else
+      Dialog.alert(
+        "Could not open preview",
+        filePreviewErrorMessage(error.cause, error.fallbackMessage),
+      );
     props.onRequestClose();
   });
   // Resolves once per presentation and holds local file leases until it closes.

@@ -13,6 +13,8 @@ export interface HostedBrowserWebviewWrapperStyle {
   readonly zIndex: number;
   readonly pointerEvents: "auto" | "none";
   readonly borderRadius?: number;
+  readonly transform?: string;
+  readonly transformOrigin?: string;
   readonly visibility?: "hidden" | "visible";
 }
 
@@ -49,7 +51,9 @@ export function resolveHostedBrowserWebviewWrapperStyle(input: {
   }
 
   if (renderingActive) {
-    // Electron stops compositing offscreen guests; keep capture-active guests inside the viewport behind the app.
+    // Electron's frame subscriber drops guest frames clipped by the host window.
+    // Fit the whole surface behind the app without resizing the page's viewport;
+    // CDP keeps its native screenshot dimensions, clips and full-page contract.
     return {
       left: 0,
       top: 0,
@@ -58,6 +62,8 @@ export function resolveHostedBrowserWebviewWrapperStyle(input: {
       zIndex: -1,
       pointerEvents: "none",
       visibility: "visible",
+      transform: `scale(min(1, calc(100vw / ${hiddenSize.width}px), calc(100vh / ${hiddenSize.height}px)))`,
+      transformOrigin: "top left",
     };
   }
 
@@ -70,4 +76,31 @@ export function resolveHostedBrowserWebviewWrapperStyle(input: {
     pointerEvents: "none",
     visibility: keepPaintableWhenInactive ? "visible" : "hidden",
   };
+}
+
+/** Acknowledge only after the committed guest bounds have reached Chromium's layout. */
+export function acknowledgeHostedBrowserWebviewLayout(
+  wrapper: HTMLElement,
+  ready: () => void,
+): () => void {
+  const view = wrapper.ownerDocument.defaultView;
+  if (!view) return () => {};
+  let frame = view.requestAnimationFrame(() => {
+    wrapper.getBoundingClientRect();
+    frame = view.requestAnimationFrame(() => {
+      const rect = wrapper.getBoundingClientRect();
+      if (
+        wrapper.isConnected &&
+        view.getComputedStyle(wrapper).visibility === "visible" &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        rect.right > 0 &&
+        rect.bottom > 0 &&
+        rect.left < view.innerWidth &&
+        rect.top < view.innerHeight
+      )
+        ready();
+    });
+  });
+  return () => view.cancelAnimationFrame(frame);
 }

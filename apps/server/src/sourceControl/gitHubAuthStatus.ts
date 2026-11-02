@@ -61,12 +61,3 @@ export function parseGitHubAuthStatus(text: string): GitHubAuthStatus {
       }) satisfies GitHubAuthStatus,
   });
 }
-
-export function findAuthenticatedGitHubAccount(
-  accounts: ReadonlyArray<GitHubAuthStatusAccount>,
-): GitHubAuthStatusAccount | undefined {
-  return (
-    accounts.find((account) => account.authenticated && account.active) ??
-    accounts.find((account) => account.authenticated)
-  );
-}

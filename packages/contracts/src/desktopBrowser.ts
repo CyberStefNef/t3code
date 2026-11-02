@@ -7,7 +7,19 @@ const TabKey = {
   tabId: TrimmedNonEmptyString,
 };
 
+export const DesktopBrowserRenderActivity = Schema.Struct({
+  leaseId: TrimmedNonEmptyString,
+  webContentsId: Schema.Int,
+  active: Schema.Boolean,
+});
+export type DesktopBrowserRenderActivity = typeof DesktopBrowserRenderActivity.Type;
+
 export const DesktopBrowserEvent = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("rendering-ready"),
+    ...TabKey,
+    leaseId: TrimmedNonEmptyString,
+  }),
   Schema.Struct({ type: Schema.Literal("attached"), ...TabKey }),
   /** Its `<webview>` went away: closed, crashed, swapped, or devtools took the debugger. */
   Schema.Struct({ type: Schema.Literal("detached"), ...TabKey }),
@@ -16,6 +28,12 @@ export const DesktopBrowserEvent = Schema.Union([
 export type DesktopBrowserEvent = typeof DesktopBrowserEvent.Type;
 
 export const DesktopBrowserCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("rendering"),
+    ...TabKey,
+    leaseId: TrimmedNonEmptyString,
+    active: Schema.Boolean,
+  }),
   Schema.Struct({ type: Schema.Literal("cdp"), ...TabKey, message: Schema.String }),
   Schema.Struct({ type: Schema.Literal("release"), ...TabKey }),
   Schema.Struct({

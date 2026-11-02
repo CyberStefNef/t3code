@@ -4,14 +4,18 @@ import type {
   ScopedThreadRef,
 } from "@t3tools/contracts";
 import { useShallow } from "zustand/react/shallow";
-import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useEffectEvent, useRef, useState } from "react";
 
 import { previewBridge } from "~/components/preview/previewBridge";
 import { usePreviewBridge } from "~/components/preview/usePreviewBridge";
 import { useClientSettingsHydrated } from "~/hooks/useSettings";
 import { cn, isMacPlatform } from "~/lib/utils";
 
-import { resolveBrowserSurfacePanelRect, useBrowserSurfaceStore } from "./browserSurfaceStore";
+import {
+  acquireBrowserSurfaceActivity,
+  resolveBrowserSurfacePanelRect,
+  useBrowserSurfaceStore,
+} from "./browserSurfaceStore";
 import { useActiveBrowserRecordingTabIds } from "./browserRecording";
 import {
   browserViewportSettingKey,
@@ -21,7 +25,10 @@ import {
 import { BrowserDeviceToolbar } from "./BrowserDeviceToolbar";
 import { BrowserViewportResizeHandles } from "./BrowserViewportResizeHandles";
 import { acquireDesktopTab, type AcquiredDesktopTab, withDesktopTab } from "./desktopTabLifetime";
-import { resolveHostedBrowserWebviewWrapperStyle } from "./hostedBrowserWebviewStyle";
+import {
+  acknowledgeHostedBrowserWebviewLayout,
+  resolveHostedBrowserWebviewWrapperStyle,
+} from "./hostedBrowserWebviewStyle";
 import { usePreviewWebviewConfig } from "./previewWebviewConfigState";
 import { useBrowserLayoutZoomFactor } from "./useBrowserLayoutZoomFactor";
 import { useBrowserViewportResize } from "./useBrowserViewportResize";
@@ -99,6 +106,58 @@ export function HostedBrowserWebview(props: {
   const backgroundActivity = useBrowserSurfaceStore(
     (state) => (state.activityByTabId[runtimeTabId] ?? 0) > 0,
   );
+  const renderLeases = useRef(new Map<string, () => void>());
+  const [renderLeaseVersion, setRenderLeaseVersion] = useState(0);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Subscribe to desktop rendering leases for this guest and release them when it unmounts.
+  useEffect(() => {
+    const bridge = window.desktopBridge?.preview;
+    if (!bridge) return;
+    const leases = renderLeases.current;
+    const unsubscribe = bridge.onRenderActivity((event) => {
+      if (!event.active) {
+        if (!leases.has(event.leaseId)) return;
+        leases.get(event.leaseId)?.();
+        leases.delete(event.leaseId);
+        setRenderLeaseVersion((version) => version + 1);
+        return;
+      }
+      const webview = webviewRef.current;
+      if (!webview) return;
+      // Only the component owning this guest can acquire and acknowledge its lease.
+      try {
+        if (webview.getWebContentsId() !== event.webContentsId) return;
+      } catch {
+        return;
+      }
+      if (!leases.has(event.leaseId))
+        leases.set(event.leaseId, acquireBrowserSurfaceActivity(runtimeTabId));
+      setRenderLeaseVersion((version) => version + 1);
+    });
+    return () => {
+      unsubscribe();
+      for (const release of leases.values()) release();
+      leases.clear();
+    };
+  }, [runtimeTabId]);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Acknowledge the external capture request only after React commits the guest's capture layout.
+  useLayoutEffect(() => {
+    const bridge = window.desktopBridge?.preview;
+    if (
+      !bridge ||
+      !backgroundActivity ||
+      renderLeaseVersion === 0 ||
+      renderLeases.current.size === 0
+    )
+      return;
+    // React has committed the activity style. Let Chromium apply the guest's
+    // bounds before acknowledging; capture must never race the hidden layout.
+    const wrapper = wrapperRef.current;
+    if (!wrapper) return;
+    return acknowledgeHostedBrowserWebviewLayout(wrapper, () => {
+      if (!webviewRef.current) return;
+      for (const leaseId of renderLeases.current.keys()) void bridge.acknowledgeRendering(leaseId);
+    });
+  }, [renderLeaseVersion, backgroundActivity]);
   const recordingActive = useActiveBrowserRecordingTabIds().has(runtimeTabId);
   usePreviewBridge({ threadRef, tabId, runtimeTabId, serverDriven });
 

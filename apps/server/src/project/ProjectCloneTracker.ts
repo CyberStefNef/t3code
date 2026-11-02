@@ -5,6 +5,7 @@ import type {
   ProjectCloneStartInput,
   ProjectCloneStartResult,
   ProjectId,
+  SourceControlCloneProtocol,
   SourceControlRepositoryInfo,
 } from "@t3tools/contracts";
 import {
@@ -87,6 +88,7 @@ interface TrackedClone {
     readonly githubAccount?: string;
     readonly destinationPath: string;
     readonly repository: SourceControlRepositoryInfo | null;
+    readonly protocol: SourceControlCloneProtocol;
   };
 }
 
@@ -223,6 +225,7 @@ export const make = Effect.gen(function* () {
         destinationPath: tracked.input.destinationPath,
         ...(tracked.input.provider ? { provider: tracked.input.provider } : {}),
         ...(tracked.input.githubAccount ? { githubAccount: tracked.input.githubAccount } : {}),
+        protocol: tracked.input.protocol,
       },
       {
         onProgress: (update) =>
@@ -304,6 +307,7 @@ export const make = Effect.gen(function* () {
             ...(input.githubAccount ? { githubAccount: input.githubAccount } : {}),
             destinationPath: prepared.destinationPath,
             repository: prepared.repository,
+            protocol: input.protocol ?? "auto",
           },
         });
         return [true, next] as const;

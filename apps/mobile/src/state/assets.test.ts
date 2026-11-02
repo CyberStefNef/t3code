@@ -107,3 +107,16 @@ it("lets the server authorize an explicit refresh before the client grant loads"
   state.mint.mockResolvedValue(AsyncResult.failure(Cause.fail(denied)));
   await expect(useRefreshAssetUrl(environmentId, resource)()).resolves.toBeNull();
 });
+
+it("preserves the server's permission denial when opening a preview", async () => {
+  const denied = new EnvironmentAuthorizationError({
+    message: "The authenticated token is missing required scope: filesystem:read.",
+    requiredScope: "orchestration:read",
+    requiredPermission: AuthFilesystemReadScope,
+  });
+  state.mint.mockResolvedValue(AsyncResult.failure(Cause.fail(denied)));
+
+  await expect(useRefreshAssetUrl(environmentId, resource)({ throwOnError: true })).rejects.toEqual(
+    denied,
+  );
+});

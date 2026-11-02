@@ -7,7 +7,7 @@ import {
   createProjectFaviconUrlAtomFamily,
   EMPTY_ASSET_URL_ATOM,
 } from "@t3tools/client-runtime/state/assets";
-import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
+import { squashAtomCommandFailure, executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
 import type { AssetResource, EnvironmentId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import { Atom, AsyncResult } from "effect/reactivity";
@@ -80,19 +80,18 @@ export function useAssetUrl(
 export function useRefreshAssetUrl(
   environmentId: EnvironmentId | null,
   resource: AssetResource | null,
-): () => Promise<string | null> {
+): (options?: { readonly throwOnError?: boolean }) => Promise<string | null> {
   const connection = usePreparedConnection(environmentId);
   const httpBaseUrl = connection._tag === "Some" ? connection.value.httpBaseUrl : null;
   const createUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
     refresh: true,
     reportFailure: false,
   });
-  return async () => {
+  return async (options) => {
     if (environmentId === null || resource === null || httpBaseUrl === null) return null;
-    const state = assetUrlStateFromResult(
-      await createUrl({ environmentId, input: { resource } }),
-      httpBaseUrl,
-    );
+    const result = await createUrl({ environmentId, input: { resource } });
+    if (options?.throwOnError && result._tag === "Failure") throw squashAtomCommandFailure(result);
+    const state = assetUrlStateFromResult(result, httpBaseUrl);
     return state._tag === "Success" ? state.url : null;
   };
 }
@@ -102,6 +101,7 @@ export async function refreshAssetUrl(
   environmentId: EnvironmentId,
   resource: AssetResource,
   signal?: AbortSignal,
+  options?: { readonly throwOnError?: boolean },
 ): Promise<string | null> {
   const connectionAtom = environmentSession.preparedConnectionValueAtom(environmentId);
   if (appAtomRegistry.get(connectionAtom)._tag === "None") return null;
@@ -112,6 +112,7 @@ export async function refreshAssetUrl(
     reportFailure: false,
     ...(signal ? { signal } : {}),
   });
+  if (options?.throwOnError && result._tag === "Failure") throw squashAtomCommandFailure(result);
   // A route can change while the query runs; resolve against the connection now current.
   const connection = appAtomRegistry.get(connectionAtom);
   if (connection._tag === "None") return null;

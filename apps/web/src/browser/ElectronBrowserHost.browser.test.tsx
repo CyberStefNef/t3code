@@ -58,6 +58,7 @@ import {
 import { reconcilePreviewServerSessions, resetPreviewStateForTests } from "~/previewStateStore";
 import { AppAtomRegistryProvider } from "~/rpc/atomRegistry";
 import { ElectronBrowserHost } from "./ElectronBrowserHost";
+import { useBrowserSurfaceStore } from "./browserSurfaceStore";
 
 const threadRef = scopeThreadRef(
   EnvironmentId.make("host-webview-order"),
@@ -160,4 +161,71 @@ describe("ElectronBrowserHost", () => {
     expect(after).toHaveLength(2);
     expect(after.every((node, index) => node.isSameNode(before[index]!))).toBe(true);
   });
+});
+
+it("acknowledges background capture layout and keeps the guest paintable until every lease is released", async () => {
+  using _state = setup();
+  const previousBridge = window.desktopBridge;
+  const listeners = new Set<Parameters<DesktopPreviewBridge["onRenderActivity"]>[0]>();
+  const acknowledgeRendering = vi.fn(async (_leaseId: string) => {});
+  window.desktopBridge = {
+    preview: {
+      onPointerEvent: () => () => {},
+      onOpenLink: () => () => {},
+      setAnnotationTheme: async () => {},
+      onRenderActivity: (listener: Parameters<DesktopPreviewBridge["onRenderActivity"]>[0]) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      acknowledgeRendering,
+    },
+  } as unknown as NonNullable<typeof window.desktopBridge>;
+  using _bridge = {
+    [Symbol.dispose]: () => {
+      if (previousBridge) window.desktopBridge = previousBridge;
+      else delete window.desktopBridge;
+    },
+  };
+  reconcilePreviewServerSessions(threadRef, {
+    sessions: [
+      {
+        ...snapshot("capture-tab", "2026-01-01T00:00:01.000Z"),
+        viewport: { _tag: "freeform", width: 3000, height: 2000 },
+      },
+    ],
+    serverEpoch: "capture-server",
+    revision: 1,
+  });
+  let runtimeTabId: string;
+  {
+    await using screen = await renderHost();
+    const guest = screen.container.querySelector("webview")!;
+    Object.assign(guest, { getWebContentsId: () => 42 });
+    runtimeTabId = guest.getAttribute("data-preview-tab")!;
+    const wrapper = guest.closest<HTMLElement>("[data-preview-rendering]")!;
+    const emit = (leaseId: string, active: boolean) =>
+      act(() => {
+        for (const listener of listeners) listener({ leaseId, active, webContentsId: 42 });
+      });
+    await emit("first", true);
+    await vi.waitFor(() => expect(acknowledgeRendering).toHaveBeenCalledWith("first"));
+    expect(wrapper.dataset.previewRendering).toBe("active");
+    expect(wrapper.style.left).toBe("0px");
+    expect(wrapper.style.zIndex).toBe("-1");
+    // A partial intersection ACK lets Electron discard frames clipped by the host.
+    const bounds = wrapper.getBoundingClientRect();
+    expect(bounds.right).toBeLessThanOrEqual(window.innerWidth + 1);
+    expect(bounds.bottom).toBeLessThanOrEqual(window.innerHeight + 1);
+    expect(wrapper.offsetWidth).toBe(3000);
+    expect(wrapper.offsetHeight).toBe(2000);
+    await emit("second", true);
+    await vi.waitFor(() => expect(acknowledgeRendering).toHaveBeenCalledWith("second"));
+    await emit("first", false);
+    expect(wrapper.dataset.previewRendering).toBe("active");
+    await emit("second", false);
+    expect(wrapper.dataset.previewRendering).toBe("suspended");
+    await emit("unmount", true);
+  }
+  expect(useBrowserSurfaceStore.getState().activityByTabId[runtimeTabId]).toBeUndefined();
+  expect(listeners.size).toBe(0);
 });

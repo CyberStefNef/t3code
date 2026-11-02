@@ -221,6 +221,7 @@ import {
 import {
   ORCHESTRATION_V2_WS_METHODS,
   OrchestrationGetWorkflowScriptError,
+  OrchestrationV2GetNativeChildWorkError,
   OrchestrationV2StopWorkflowError,
   OrchestrationV2ForceStopThreadError,
   OrchestrationV2DispatchCommandError,
@@ -1300,34 +1301,25 @@ const WsSourceControlPublishRepositoryRpc = Rpc.make(WS_METHODS.sourceControlPub
   error: Schema.Union([SourceControlRepositoryError, EnvironmentAuthorizationError]),
 });
 
-export const WsSourceControlGetGitHubAccountRpc = Rpc.make(
-  WS_METHODS.sourceControlGetGitHubAccount,
-  {
-    payload: GitHubAccountBindingInput,
-    success: GitHubAccountBinding,
-    error: Schema.Union([SourceControlProviderError, EnvironmentAuthorizationError]),
-  },
-);
+const WsSourceControlGetGitHubAccountRpc = Rpc.make(WS_METHODS.sourceControlGetGitHubAccount, {
+  payload: GitHubAccountBindingInput,
+  success: GitHubAccountBinding,
+  error: Schema.Union([SourceControlProviderError, EnvironmentAuthorizationError]),
+});
 
-export const WsSourceControlSetGitHubAccountRpc = Rpc.make(
-  WS_METHODS.sourceControlSetGitHubAccount,
-  {
-    payload: GitHubAccountBindingUpdateInput,
-    success: GitHubAccountBinding,
-    error: Schema.Union([SourceControlProviderError, EnvironmentAuthorizationError]),
-  },
-);
+const WsSourceControlSetGitHubAccountRpc = Rpc.make(WS_METHODS.sourceControlSetGitHubAccount, {
+  payload: GitHubAccountBindingUpdateInput,
+  success: GitHubAccountBinding,
+  error: Schema.Union([SourceControlProviderError, EnvironmentAuthorizationError]),
+});
 
-export const WsSourceControlStartGitHubLoginRpc = Rpc.make(
-  WS_METHODS.sourceControlStartGitHubLogin,
-  {
-    payload: Schema.Struct({}),
-    success: GitHubLoginStartResult,
-    error: Schema.Union([SourceControlProviderError, EnvironmentAuthorizationError]),
-  },
-);
+const WsSourceControlStartGitHubLoginRpc = Rpc.make(WS_METHODS.sourceControlStartGitHubLogin, {
+  payload: Schema.Struct({}),
+  success: GitHubLoginStartResult,
+  error: Schema.Union([SourceControlProviderError, EnvironmentAuthorizationError]),
+});
 
-export const WsSourceControlGetGitHubLoginStatusRpc = Rpc.make(
+const WsSourceControlGetGitHubLoginStatusRpc = Rpc.make(
   WS_METHODS.sourceControlGetGitHubLoginStatus,
   {
     payload: GitHubLoginStatusInput,
@@ -1336,7 +1328,7 @@ export const WsSourceControlGetGitHubLoginStatusRpc = Rpc.make(
   },
 );
 
-export const WsSourceControlLogoutGitHubAccountRpc = Rpc.make(
+const WsSourceControlLogoutGitHubAccountRpc = Rpc.make(
   WS_METHODS.sourceControlLogoutGitHubAccount,
   {
     payload: GitHubAccountLogoutInput,
@@ -1345,7 +1337,7 @@ export const WsSourceControlLogoutGitHubAccountRpc = Rpc.make(
   },
 );
 
-export const WsProjectsSearchEntriesRpc = Rpc.make(WS_METHODS.projectsSearchEntries, {
+const WsProjectsSearchEntriesRpc = Rpc.make(WS_METHODS.projectsSearchEntries, {
   payload: ProjectSearchEntriesInput,
   success: ProjectSearchEntriesResult,
   error: Schema.Union([ProjectSearchEntriesError, EnvironmentAuthorizationError]),
@@ -1874,6 +1866,15 @@ const WsOrchestrationV2GetWorkflowScriptRpc = Rpc.make(
   },
 );
 
+const WsOrchestrationV2GetNativeChildWorkRpc = Rpc.make(
+  ORCHESTRATION_V2_WS_METHODS.getNativeChildWork,
+  {
+    payload: OrchestrationV2RpcSchemas.getNativeChildWork.input,
+    success: OrchestrationV2RpcSchemas.getNativeChildWork.output,
+    error: Schema.Union([OrchestrationV2GetNativeChildWorkError, EnvironmentAuthorizationError]),
+  },
+);
+
 const WsOrchestrationV2GetTurnItemRpc = Rpc.make(ORCHESTRATION_V2_WS_METHODS.getTurnItem, {
   payload: OrchestrationV2RpcSchemas.getTurnItem.input,
   success: OrchestrationV2RpcSchemas.getTurnItem.output,
@@ -2224,6 +2225,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeResourceTelemetryRpc,
   WsOrchestrationV2DispatchCommandRpc,
   WsOrchestrationV2GetWorkflowScriptRpc,
+  WsOrchestrationV2GetNativeChildWorkRpc,
   WsOrchestrationV2StopWorkflowRpc,
   WsOrchestrationV2ForceStopThreadRpc,
   WsOrchestrationV2GetTurnItemRpc,

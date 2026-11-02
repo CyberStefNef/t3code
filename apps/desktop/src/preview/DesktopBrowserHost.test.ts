@@ -39,6 +39,7 @@ const makeDebuggee = (
 ) => {
   const emitter = new NodeEvents.EventEmitter();
   const pending: Array<() => void> = [];
+  const sentEvents = new NodeEvents.EventEmitter();
   const focusChanges: Array<() => void> = [];
   const sent: Array<unknown> = [];
   const sendWaiters: Array<() => void> = [];
@@ -54,6 +55,7 @@ const makeDebuggee = (
           reject(new Error("Refused"));
           return;
         }
+        sentEvents.emit(method, params, sessionId);
         if (method === "Target.getTargetInfo") {
           resolve({ targetInfo: { targetId: "GUEST" } });
           return;
@@ -69,7 +71,20 @@ const makeDebuggee = (
         sendWaiters.shift()?.();
       }),
   });
+  let present = () => {};
+  let painting = false;
   const webContents = Object.assign(new NodeEvents.EventEmitter(), {
+    isDestroyed: () => false,
+    beginFrameSubscription: (_onlyDirty: boolean, callback: () => void) => {
+      painting = true;
+      present = callback;
+    },
+    endFrameSubscription: () => {
+      painting = false;
+    },
+    invalidate: () => present(),
+    id: 9,
+    hostWebContents: { id: 10 },
     getURL: () => "http://localhost/",
     getTitle: () => "Page",
     getUserAgent: () => "Electron",
@@ -88,6 +103,8 @@ const makeDebuggee = (
     release: () => pending.splice(0).forEach((resolve) => resolve()),
     releaseFirst: () => pending.shift()?.(),
     settleFocus: () => focusChanges.splice(0).forEach((resolve) => resolve()),
+    sentEvents,
+    isPainting: () => painting,
   };
 };
 
@@ -179,7 +196,9 @@ describe("DesktopBrowserHost", () => {
       host.attach(key, debuggee.tab);
       const replies = yield* watchReplies(host);
 
+      const firstSend = debuggee.nextSend();
       yield* command(host, 1, "Page.captureScreenshot");
+      yield* Effect.promise(() => firstSend);
       yield* command(host, 2, "Page.captureScreenshot");
       yield* command(host, 3, "DOM.enable");
       yield* settle;
@@ -202,7 +221,9 @@ describe("DesktopBrowserHost", () => {
       yield* command(host, 2, "Page.captureScreenshot");
       yield* command(host, 3, "Page.captureScreenshot");
       yield* settle;
+      const nextSend = debuggee.nextSend();
       debuggee.navigate();
+      yield* Effect.promise(() => nextSend);
       expect(debuggee.sent).toEqual([1, 2]);
 
       // The superseded screenshot answering late must not start a third beside the second.
@@ -319,7 +340,9 @@ describe("DesktopBrowserHost", () => {
       yield* command(host, 1, "Page.captureScreenshot");
       yield* command(host, 2, "Page.captureScreenshot");
       yield* settle;
+      const nextSend = debuggee.nextSend();
       debuggee.navigate();
+      yield* Effect.promise(() => nextSend);
       expect(debuggee.sent).toEqual([1, 2]);
       yield* TestClock.adjust("1 minute");
       expect(debuggee.focusEmulation).toEqual([true]);
@@ -917,12 +940,14 @@ describe("DesktopBrowserHost", () => {
       const host = yield* DesktopBrowserHost.make;
       const debuggee = makeDebuggee();
       host.attach(key, debuggee.tab);
+      const replies = yield* watchReplies(host);
       const paths: Array<string> = [];
       const item = {
         setSavePath: (path: string) => void paths.push(path),
       } as unknown as Electron.DownloadItem;
 
       expect(host.placeDownload(debuggee.tab.webContents, item)).toBe(false);
+      const sent = debuggee.nextSend();
       yield* host.handleCommandLine(
         encodeJson({
           type: "cdp",
@@ -934,10 +959,15 @@ describe("DesktopBrowserHost", () => {
           }),
         }),
       );
-      debuggee.emit("Browser.downloadWillBegin", { guid: "guid-1", suggestedFilename: "r.csv" });
+      yield* Effect.promise(() => sent);
+      debuggee.release();
+      expect(yield* Queue.take(replies)).toBe(1);
+      debuggee.emit("Page.downloadWillBegin", { guid: "guid-1", suggestedFilename: "r.csv" });
+      expect(host.placeDownload(makeDebuggee().tab.webContents, item)).toBe(false);
       expect(host.placeDownload(debuggee.tab.webContents, item)).toBe(true);
       expect(paths).toEqual(["/srv/downloads/guid-1"]);
-    }),
+      expect(host.placeDownload(debuggee.tab.webContents, item)).toBe(false);
+    }).pipe(Effect.scoped),
   );
 
   it.effect("tells a download the person clicked from one the agent's input started", () =>
@@ -1038,3 +1068,107 @@ describe("DesktopBrowserHost", () => {
     }).pipe(Effect.scoped),
   );
 });
+
+it.effect(
+  "forwards render leases only for attached tabs and accepts acknowledgements only from the guest host",
+  () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      host.attach(key, makeDebuggee().tab);
+      const events = yield* Stream.toPull(host.events);
+      const first = yield* events;
+      expect(decodeEvent(new TextDecoder().decode(first[0]))).toEqual({ type: "attached", ...key });
+      const command = (active: boolean) =>
+        host.handleCommandLine(encodeJson({ type: "rendering", ...key, leaseId: "lease", active }));
+      yield* command(true);
+      yield* host.acknowledgeRendering("lease", 99);
+      yield* host.acknowledgeRendering("lease", 10);
+      const replies = yield* events;
+      expect(decodeEvent(new TextDecoder().decode(replies[0]))).toEqual({
+        type: "rendering-ready",
+        ...key,
+        leaseId: "lease",
+      });
+      host.detach(key);
+      yield* host.acknowledgeRendering("lease", 10);
+      const detached = yield* events;
+      expect(decodeEvent(new TextDecoder().decode(detached[0]))).toEqual({
+        type: "detached",
+        ...key,
+      });
+    }).pipe(Effect.scoped),
+);
+
+it.effect("forwards screenshot format, clip, scale and full-page arguments unchanged", () =>
+  Effect.gen(function* () {
+    const host = yield* DesktopBrowserHost.make;
+    const debuggee = makeDebuggee();
+    host.attach(key, debuggee.tab);
+    const events = yield* Stream.toPull(host.events);
+    yield* events;
+    const captures = [
+      { format: "png" },
+      { format: "jpeg", quality: 70, clip: { x: 12, y: 34, width: 960, height: 600, scale: 0.5 } },
+      {
+        format: "png",
+        captureBeyondViewport: true,
+        clip: { x: 0, y: 0, width: 960, height: 1800, scale: 1 },
+      },
+    ];
+    for (const [index, params] of captures.entries()) {
+      const sent = Promise.withResolvers<readonly [unknown, string | undefined]>();
+      debuggee.sentEvents.once(
+        "Page.captureScreenshot",
+        (params: unknown, sessionId: string | undefined) => sent.resolve([params, sessionId]),
+      );
+      yield* host.handleCommandLine(
+        encodeJson({
+          type: "cdp",
+          ...key,
+          message: encodeJson({
+            id: index + 1,
+            method: "Page.captureScreenshot",
+            params,
+            sessionId: "t3-preview-page",
+          }),
+        }),
+      );
+      const [actual, sessionId] = yield* Effect.promise(() => sent.promise);
+      expect(actual).toEqual(params);
+      expect(sessionId).toBeUndefined();
+      debuggee.release();
+      const reply = yield* events;
+      expect(decodeEvent(new TextDecoder().decode(reply[0]))).toMatchObject({ type: "cdp" });
+    }
+  }).pipe(Effect.scoped),
+);
+
+it.effect("keeps the guest paintable while its native CDP screenshot is pending", () =>
+  Effect.gen(function* () {
+    const host = yield* DesktopBrowserHost.make;
+    const debuggee = makeDebuggee();
+    host.attach(key, debuggee.tab);
+    const events = yield* Stream.toPull(host.events);
+    yield* events;
+    const entered = Promise.withResolvers<void>();
+    debuggee.sentEvents.once("Page.captureScreenshot", () => entered.resolve());
+    yield* host.handleCommandLine(
+      encodeJson({
+        type: "cdp",
+        ...key,
+        message: encodeJson({
+          id: 1,
+          method: "Page.captureScreenshot",
+          params: { format: "png" },
+          sessionId: "t3-preview-page",
+        }),
+      }),
+    );
+    yield* Effect.promise(() => entered.promise);
+    const paintingDuringCapture = debuggee.isPainting();
+    debuggee.release();
+    yield* events;
+    expect(paintingDuringCapture).toBe(true);
+    expect(debuggee.isPainting()).toBe(false);
+  }).pipe(Effect.scoped),
+);
