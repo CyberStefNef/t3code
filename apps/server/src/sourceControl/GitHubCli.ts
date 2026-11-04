@@ -1,6 +1,6 @@
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
-import * as Crypto from "effect/Crypto";
+import * as Digest from "effect/crypto/Digest";
 import * as Hex from "effect/encoding/Hex";
 import * as Cache from "effect/Cache";
 import * as Clock from "effect/Clock";
@@ -1078,7 +1078,7 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  const crypto = yield* Crypto.Crypto;
+  const crypto = yield* Digest.Digest;
   const budget = yield* GitHubGraphQlBudget.GitHubGraphQlBudget;
   const limits = yield* SourceControlRateLimit.SourceControlRateLimit;
 
@@ -1243,7 +1243,7 @@ export const make = Effect.gen(function* () {
     const fingerprint =
       credential?.credentialFingerprint ??
       (selectedToken
-        ? `${input.host}:${yield* crypto.digest("SHA-256", new TextEncoder().encode(selectedToken)).pipe(Effect.map(Hex.encode), Effect.orDie)}`
+        ? `${input.host}:${yield* crypto.digest(Digest.sha256, new TextEncoder().encode(selectedToken)).pipe(Effect.map(Hex.encode), Effect.orDie)}`
         : "");
     const key = { provider: SourceControlProviderKind.make("github"), host: input.host };
     const guarded = Effect.gen(function* () {
