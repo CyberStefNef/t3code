@@ -32,6 +32,7 @@ import {
   type VcsError,
 } from "@t3tools/contracts";
 import { normalizeGitRemoteUrl } from "@t3tools/shared/git";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { decodeJsonResult } from "@t3tools/shared/schemaJson";
 
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -624,6 +625,7 @@ export function selectGitHubBaseRepository(input: {
 /** @public */
 export const make = Effect.gen(function* () {
   const vcsProcess = yield* VcsProcess.VcsProcess;
+  const hostEnvironment = yield* HostProcess.Environment;
   const spawner = yield* Effect.serviceOption(ChildProcessSpawner.ChildProcessSpawner);
   const serviceScope = yield* Effect.scope;
   let activeLogin: {
@@ -1307,7 +1309,7 @@ export const make = Effect.gen(function* () {
           commandHosts(input.args).find((host) => host !== null) ??
           input.rateLimitHost ??
           input.env?.GH_HOST ??
-          globalThis.process.env.GH_HOST ??
+          hostEnvironment.GH_HOST ??
           "github.com"
         ).toLowerCase(),
         document: "query {}",
@@ -1375,7 +1377,7 @@ export const make = Effect.gen(function* () {
 
   /** The repository gh reads in `cwd`, or null when gh could pick it another way. */
   const resolveBaseRepository = (cwd: string, host: string) =>
-    globalThis.process.env.GH_REPO
+    hostEnvironment.GH_REPO
       ? Effect.succeed(null)
       : Effect.all([
           git(cwd, ["remote", "-v"]),
